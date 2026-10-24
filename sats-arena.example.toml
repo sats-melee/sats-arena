@@ -1,0 +1,20 @@
+# Copy to sats-arena.toml and edit. Run with: sats-arena-server sats-arena.toml
+
+# Use 0.0.0.0:8080 to accept connections from other machines.
+listen = "127.0.0.1:8080"
+database = "sats-arena.db"
+
+# Anyone with this code can create an account on your server.
+invite_code = "change-me"
+
+[rules]
+# The victim pays the attacker this much for every 1% of damage.
+sats_per_percent = 1
+# Each loser pays the winner this much when a game ends.
+win_sats = 100
+max_deposit_sats = 100000
+invoice_expiry_secs = 600
+
+[wallet]
+# "fake" moves no real sats. NWC support is coming next.
+backend = "fake"
