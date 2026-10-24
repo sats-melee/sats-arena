@@ -12,16 +12,15 @@ path = "src/main.rs"
 
 [dependencies]
 sats-arena-protocol = { workspace = true }
+sats-arena-core = { workspace = true }
 anyhow = "1"
-async-trait = "0.1"
 axum = "0.8"
-hex = "0.4"
-rand = "0.9"
-rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

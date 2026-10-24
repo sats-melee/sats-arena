@@ -1,0 +1,24 @@
+[package]
+name = "sats-arena-core"
+description = "Shared payment engine for embedded local play and remote Arena servers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+sats-arena-protocol = { workspace = true }
+anyhow = "1"
+async-trait = "0.1"
+hex = "0.4"
+rand = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

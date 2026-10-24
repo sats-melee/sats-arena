@@ -7,11 +7,12 @@ use anyhow::Context;
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sats_arena_protocol::{
-    Account, Deposit, DepositStatus, MatchReport, MatchStatus, Transfer, Withdrawal, WithdrawalStatus,
+    Account, Deposit, DepositStatus, MatchReport, MatchStatus, Transfer, Withdrawal,
+    WithdrawalStatus,
 };
 use sha2::{Digest, Sha256};
 
-use crate::{config::Rules, settle};
+use crate::{Error, MAX_BALANCE_SATS, Result, Rules, settle};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS players (
@@ -62,29 +63,18 @@ CREATE TABLE IF NOT EXISTS matches (
     transfers TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
+CREATE TABLE IF NOT EXISTS match_terms (
+    match_id TEXT PRIMARY KEY,
+    rules TEXT NOT NULL
+);
 ";
 
-#[derive(Debug)]
-pub enum LedgerError {
-    /// The request was wrong; safe to show to the client.
-    Rejected(String),
-    Internal(anyhow::Error),
-}
-
-impl<E: Into<anyhow::Error>> From<E> for LedgerError {
-    fn from(error: E) -> Self {
-        Self::Internal(error.into())
-    }
-}
-
-pub type Result<T> = std::result::Result<T, LedgerError>;
-
 fn rejected<T>(message: impl Into<String>) -> Result<T> {
-    Err(LedgerError::Rejected(message.into()))
+    Err(Error::Rejected(message.into()))
 }
 
 pub struct Ledger {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 pub struct PendingWithdrawal {
@@ -107,6 +97,7 @@ impl Ledger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(crate::lobby::SCHEMA)?;
         Ok(Self { conn })
     }
 
@@ -127,7 +118,11 @@ impl Ledger {
     pub fn authenticate(&self, token: &str) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row("SELECT id FROM players WHERE token_hash = ?1", [hash_token(token)], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM players WHERE token_hash = ?1",
+                [hash_token(token)],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -135,18 +130,38 @@ impl Ledger {
         Ok(self.conn.query_row(
             "SELECT id, name, balance_sats FROM players WHERE id = ?1",
             [player_id],
-            |r| Ok(Account { player_id: r.get(0)?, name: r.get(1)?, balance_sats: r.get::<_, i64>(2)? as u64 }),
+            |r| {
+                Ok(Account {
+                    player_id: r.get(0)?,
+                    name: r.get(1)?,
+                    balance_sats: r.get::<_, i64>(2)? as u64,
+                })
+            },
         )?)
     }
 
-    pub fn insert_deposit(&mut self, player_id: &str, amount_sats: u64, bolt11: &str, payment_hash: &str) -> Result<Deposit> {
+    pub fn insert_deposit(
+        &mut self,
+        player_id: &str,
+        amount_sats: u64,
+        bolt11: &str,
+        payment_hash: &str,
+    ) -> Result<Deposit> {
+        if amount_sats == 0 || amount_sats > MAX_BALANCE_SATS {
+            return rejected("invalid deposit amount");
+        }
         let id = random_id();
         self.conn.execute(
             "INSERT INTO deposits (id, player_id, amount_sats, bolt11, payment_hash, status)
              VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
             params![id, player_id, amount_sats as i64, bolt11, payment_hash],
         )?;
-        Ok(Deposit { id, amount_sats, bolt11: bolt11.into(), status: DepositStatus::Pending })
+        Ok(Deposit {
+            id,
+            amount_sats,
+            bolt11: bolt11.into(),
+            status: DepositStatus::Pending,
+        })
     }
 
     /// Returns the deposit and its payment hash, if it belongs to the player.
@@ -171,9 +186,13 @@ impl Ledger {
             .optional()?)
     }
 
-    pub fn pending_deposits(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, payment_hash FROM deposits WHERE status = 'pending'")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    pub fn pending_deposits(&self) -> Result<Vec<(String, String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, payment_hash, amount_sats FROM deposits WHERE status = 'pending'",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -196,7 +215,10 @@ impl Ledger {
     }
 
     pub fn expire_deposit(&mut self, id: &str) -> Result<()> {
-        self.conn.execute("UPDATE deposits SET status = 'expired' WHERE id = ?1 AND status = 'pending'", [id])?;
+        self.conn.execute(
+            "UPDATE deposits SET status = 'expired' WHERE id = ?1 AND status = 'pending'",
+            [id],
+        )?;
         Ok(())
     }
 
@@ -218,10 +240,19 @@ impl Ledger {
         if exists {
             return rejected("this invoice has already been submitted");
         }
-        let reserved = amount_sats + fee_reserve_sats;
-        let balance: i64 = tx.query_row("SELECT balance_sats FROM players WHERE id = ?1", [player_id], |r| r.get(0))?;
+        let reserved = amount_sats
+            .checked_add(fee_reserve_sats)
+            .filter(|value| amount_sats > 0 && *value <= MAX_BALANCE_SATS)
+            .ok_or_else(|| Error::Rejected("invalid withdrawal amount or fee".into()))?;
+        let balance: i64 = tx.query_row(
+            "SELECT balance_sats FROM players WHERE id = ?1",
+            [player_id],
+            |r| r.get(0),
+        )?;
         if (balance as u64) < reserved {
-            return rejected(format!("withdrawing {amount_sats} sats needs {reserved} including the fee reserve"));
+            return rejected(format!(
+                "withdrawing {amount_sats} sats needs {reserved} including the fee reserve"
+            ));
         }
         let id = random_id();
         tx.execute(
@@ -235,9 +266,18 @@ impl Ledger {
     }
 
     /// Records a definite payment result and refunds whatever wasn't spent.
-    pub fn finish_withdrawal(&mut self, id: &str, fee_sats: Option<u64>, error: Option<&str>) -> Result<()> {
+    pub fn finish_withdrawal(
+        &mut self,
+        id: &str,
+        fee_sats: Option<u64>,
+        error: Option<&str>,
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let status = if fee_sats.is_some() { "completed" } else { "failed" };
+        let status = if fee_sats.is_some() {
+            "completed"
+        } else {
+            "failed"
+        };
         let row: Option<(String, i64, i64)> = tx
             .query_row(
                 "UPDATE withdrawals SET status = ?2, error = ?3 WHERE id = ?1 AND status = 'pending'
@@ -247,6 +287,12 @@ impl Ledger {
             )
             .optional()?;
         if let Some((player_id, amount, reserved)) = row {
+            if fee_sats.is_some_and(|fee| fee > (reserved - amount) as u64) {
+                // Returning before commit rolls back the status change too.
+                return rejected(
+                    "wallet exceeded the reserved routing fee; manual review is required",
+                );
+            }
             let refund = match fee_sats {
                 Some(fee) => (reserved - amount - fee as i64).max(0),
                 None => reserved,
@@ -278,31 +324,85 @@ impl Ledger {
     }
 
     pub fn pending_withdrawals(&self) -> Result<Vec<PendingWithdrawal>> {
-        let mut stmt = self.conn.prepare("SELECT id, payment_hash FROM withdrawals WHERE status = 'pending'")?;
-        let rows = stmt.query_map([], |r| Ok(PendingWithdrawal { id: r.get(0)?, payment_hash: r.get(1)? }))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, payment_hash FROM withdrawals WHERE status = 'pending'")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingWithdrawal {
+                id: r.get(0)?,
+                payment_hash: r.get(1)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Invoice hash is the idempotency key for a withdrawal. Retrying the same
+    /// request returns its existing state; it must never send a second payment.
+    pub fn withdrawal_for_invoice(
+        &self,
+        player_id: &str,
+        payment_hash: &str,
+    ) -> Result<Option<Withdrawal>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, player_id FROM withdrawals WHERE payment_hash = ?1",
+                [payment_hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((id, owner)) if owner == player_id => self.withdrawal(player_id, &id),
+            Some(_) => rejected("this invoice has already been submitted"),
+            None => Ok(None),
+        }
     }
 
     /// Stores one player's report and settles once every player has sent a
     /// matching one. Local and netplay matches follow the same rule.
-    pub fn submit_report(&mut self, player_id: &str, report: &MatchReport, rules: &Rules) -> Result<MatchStatus> {
-        settle::validate(report).map_err(LedgerError::Rejected)?;
-        let reporter = report.players.iter().find(|p| p.port == report.reporter_port);
+    pub fn submit_report(
+        &mut self,
+        player_id: &str,
+        report: &MatchReport,
+        rules: &Rules,
+    ) -> Result<MatchStatus> {
+        settle::validate(report).map_err(Error::Rejected)?;
+        let reporter = report
+            .players
+            .iter()
+            .find(|p| p.port == report.reporter_port);
         if reporter.is_none_or(|p| p.player_id != player_id) {
             return rejected("reporter_port must be the port you are playing on");
         }
 
         let tx = self.conn.transaction()?;
+        crate::lobby::check_report(&tx, report)?;
         if let Some(status) = match_status(&tx, &report.match_id)? {
             return Ok(status);
         }
         for slot in &report.players {
-            let known: bool =
-                tx.query_row("SELECT EXISTS (SELECT 1 FROM players WHERE id = ?1)", [&slot.player_id], |r| r.get(0))?;
+            let known: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM players WHERE id = ?1)",
+                [&slot.player_id],
+                |r| r.get(0),
+            )?;
             if !known {
                 return rejected(format!("unknown player {}", slot.player_id));
             }
         }
+
+        // Use the immutable terms saved at lobby creation, even after restart
+        // with a different host configuration.
+        tx.execute(
+            "INSERT OR IGNORE INTO match_terms (match_id, rules) VALUES (?1, ?2)",
+            params![report.match_id, serde_json::to_string(rules)?],
+        )?;
+        let terms: String = tx.query_row(
+            "SELECT rules FROM match_terms WHERE match_id = ?1",
+            [&report.match_id],
+            |r| r.get(0),
+        )?;
+        let match_rules: Rules = serde_json::from_str(&terms)?;
 
         let previous: Option<String> = tx
             .query_row(
@@ -325,7 +425,8 @@ impl Ledger {
         let reports: Vec<MatchReport> = {
             let mut stmt = tx.prepare("SELECT report FROM match_reports WHERE match_id = ?1")?;
             let rows = stmt.query_map([&report.match_id], |r| r.get::<_, String>(0))?;
-            rows.map(|json| Ok(serde_json::from_str(&json?)?)).collect::<anyhow::Result<_>>()?
+            rows.map(|json| Ok(serde_json::from_str(&json?)?))
+                .collect::<anyhow::Result<_>>()?
         };
 
         let status = if reports.iter().any(|other| !other.same_outcome(report)) {
@@ -333,11 +434,15 @@ impl Ledger {
                 "INSERT INTO matches (match_id, status) VALUES (?1, 'disputed')",
                 [&report.match_id],
             )?;
+            tx.execute(
+                "UPDATE lobbies SET phase = 'disputed' WHERE id = ?1",
+                [&report.match_id],
+            )?;
             MatchStatus::Disputed
         } else if reports.len() < report.players.len() {
             MatchStatus::WaitingForOpponent
         } else {
-            let transfers = settle_match(&tx, report, rules)?;
+            let transfers = settle_match(&tx, report, &match_rules)?;
             MatchStatus::Settled { transfers }
         };
         tx.commit()?;
@@ -348,15 +453,35 @@ impl Ledger {
 fn settle_match(tx: &Transaction, report: &MatchReport, rules: &Rules) -> Result<Vec<Transfer>> {
     let mut balances = HashMap::new();
     for slot in &report.players {
-        let balance: i64 =
-            tx.query_row("SELECT balance_sats FROM players WHERE id = ?1", [&slot.player_id], |r| r.get(0))?;
+        let balance: i64 = tx.query_row(
+            "SELECT amount FROM lobby_funds WHERE lobby_id = ?1 AND player_id = ?2",
+            params![report.match_id, slot.player_id],
+            |r| r.get(0),
+        )?;
         balances.insert(slot.player_id.clone(), balance as u64);
     }
     let transfers = settle::compute(report, rules, &balances);
     for t in &transfers {
-        apply(tx, &t.from_player_id, -(t.sats as i64), "match", &report.match_id)?;
-        apply(tx, &t.to_player_id, t.sats as i64, "match", &report.match_id)?;
+        *balances.get_mut(&t.from_player_id).unwrap() -= t.sats;
+        *balances.get_mut(&t.to_player_id).unwrap() += t.sats;
     }
+    for (player, amount) in balances {
+        apply(
+            tx,
+            &player,
+            amount as i64,
+            "match_release",
+            &report.match_id,
+        )?;
+    }
+    tx.execute(
+        "UPDATE lobby_funds SET amount = 0 WHERE lobby_id = ?1",
+        [&report.match_id],
+    )?;
+    tx.execute(
+        "UPDATE lobbies SET phase = 'settled' WHERE id = ?1",
+        [&report.match_id],
+    )?;
     tx.execute(
         "INSERT INTO matches (match_id, status, transfers) VALUES (?1, 'settled', ?2)",
         params![report.match_id, serde_json::to_string(&transfers)?],
@@ -366,9 +491,11 @@ fn settle_match(tx: &Transaction, report: &MatchReport, rules: &Rules) -> Result
 
 fn match_status(tx: &Transaction, match_id: &str) -> Result<Option<MatchStatus>> {
     let row: Option<(String, Option<String>)> = tx
-        .query_row("SELECT status, transfers FROM matches WHERE match_id = ?1", [match_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT status, transfers FROM matches WHERE match_id = ?1",
+            [match_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
     Ok(match row {
         None => None,
@@ -379,9 +506,26 @@ fn match_status(tx: &Transaction, match_id: &str) -> Result<Option<MatchStatus>>
     })
 }
 
-fn apply(tx: &Transaction, player_id: &str, delta: i64, kind: &str, reference: &str) -> Result<()> {
-    // The CHECK constraint rejects any change that would go below zero.
-    tx.execute("UPDATE players SET balance_sats = balance_sats + ?2 WHERE id = ?1", params![player_id, delta])?;
+pub(crate) fn apply(
+    tx: &Transaction,
+    player_id: &str,
+    delta: i64,
+    kind: &str,
+    reference: &str,
+) -> Result<()> {
+    let balance: i64 = tx.query_row(
+        "SELECT balance_sats FROM players WHERE id = ?1",
+        [player_id],
+        |r| r.get(0),
+    )?;
+    let next = balance
+        .checked_add(delta)
+        .filter(|next| *next >= 0 && (*next as u64) <= MAX_BALANCE_SATS)
+        .ok_or_else(|| Error::Rejected("balance would be outside the supported range".into()))?;
+    tx.execute(
+        "UPDATE players SET balance_sats = ?2 WHERE id = ?1",
+        params![player_id, next],
+    )?;
     tx.execute(
         "INSERT INTO entries (player_id, delta_sats, kind, reference) VALUES (?1, ?2, ?3, ?4)",
         params![player_id, delta, kind, reference],
@@ -421,7 +565,12 @@ mod tests {
     use sats_arena_protocol::{Hit, MatchMode, PROTOCOL_VERSION, PlayerSlot};
 
     fn rules() -> Rules {
-        Rules { sats_per_percent: 1, win_sats: 100, max_deposit_sats: 1_000_000, invoice_expiry_secs: 600 }
+        Rules {
+            sats_per_percent: 1,
+            win_sats: 100,
+            max_deposit_sats: 1_000_000,
+            invoice_expiry_secs: 600,
+        }
     }
 
     fn setup() -> (Ledger, String, String) {
@@ -430,7 +579,9 @@ mod tests {
         let (b, _) = ledger.register("bob").unwrap();
         for (player, n) in [(&a, 1), (&b, 2)] {
             let hash = format!("hash{n}");
-            let d = ledger.insert_deposit(player, 1000, "lnfake", &hash).unwrap();
+            let d = ledger
+                .insert_deposit(player, 1000, "lnfake", &hash)
+                .unwrap();
             ledger.credit_deposit(&d.id).unwrap();
             ledger.credit_deposit(&d.id).unwrap(); // Crediting twice must be a no-op.
         }
@@ -444,10 +595,21 @@ mod tests {
             mode: MatchMode::Netplay,
             reporter_port,
             players: vec![
-                PlayerSlot { port: 0, player_id: a.into() },
-                PlayerSlot { port: 1, player_id: b.into() },
+                PlayerSlot {
+                    port: 0,
+                    player_id: a.into(),
+                },
+                PlayerSlot {
+                    port: 1,
+                    player_id: b.into(),
+                },
             ],
-            hits: vec![Hit { frame: 100, victim_port: 1, attacker_port: Some(0), damage_centi: 5000 }],
+            hits: vec![Hit {
+                frame: 100,
+                victim_port: 1,
+                attacker_port: Some(0),
+                damage_centi: 5000,
+            }],
             winner_port,
         }
     }
@@ -456,53 +618,104 @@ mod tests {
         ledger.account(id).unwrap().balance_sats
     }
 
+    fn admit(ledger: &mut Ledger, a: &str, b: &str) {
+        let report = report(a, b, 0, Some(0));
+        ledger
+            .create_lobby(
+                a,
+                &sats_arena_protocol::LobbyRequest {
+                    id: report.match_id,
+                    mode: report.mode,
+                    players: report.players,
+                    budget_sats: 1000,
+                },
+                &rules(),
+            )
+            .unwrap();
+        ledger.ready_lobby(a, "match-1").unwrap();
+        ledger.ready_lobby(b, "match-1").unwrap();
+        ledger.start_lobby(a, "match-1").unwrap();
+    }
+
     #[test]
     fn settles_only_when_both_players_agree() {
         let (mut ledger, a, b) = setup();
         assert_eq!(balance(&ledger, &a), 1000);
-        let status = ledger.submit_report(&a, &report(&a, &b, 0, Some(0)), &rules()).unwrap();
+        admit(&mut ledger, &a, &b);
+        let status = ledger
+            .submit_report(&a, &report(&a, &b, 0, Some(0)), &rules())
+            .unwrap();
         assert_eq!(status, MatchStatus::WaitingForOpponent);
-        assert_eq!(balance(&ledger, &a), 1000);
+        assert_eq!(balance(&ledger, &a), 0); // Budget is reserved, not spendable.
 
-        let status = ledger.submit_report(&b, &report(&a, &b, 1, Some(0)), &rules()).unwrap();
+        let status = ledger
+            .submit_report(&b, &report(&a, &b, 1, Some(0)), &rules())
+            .unwrap();
         assert!(matches!(status, MatchStatus::Settled { .. }));
         assert_eq!(balance(&ledger, &a), 1150); // 50 for damage + 100 for the win.
         assert_eq!(balance(&ledger, &b), 850);
 
         // Resending is harmless and doesn't pay twice.
-        ledger.submit_report(&b, &report(&a, &b, 1, Some(0)), &rules()).unwrap();
+        ledger
+            .submit_report(&b, &report(&a, &b, 1, Some(0)), &rules())
+            .unwrap();
         assert_eq!(balance(&ledger, &a), 1150);
     }
 
     #[test]
     fn disagreement_moves_nothing() {
         let (mut ledger, a, b) = setup();
-        ledger.submit_report(&a, &report(&a, &b, 0, Some(0)), &rules()).unwrap();
-        let status = ledger.submit_report(&b, &report(&a, &b, 1, Some(1)), &rules()).unwrap();
+        admit(&mut ledger, &a, &b);
+        ledger
+            .submit_report(&a, &report(&a, &b, 0, Some(0)), &rules())
+            .unwrap();
+        let status = ledger
+            .submit_report(&b, &report(&a, &b, 1, Some(1)), &rules())
+            .unwrap();
         assert_eq!(status, MatchStatus::Disputed);
-        assert_eq!((balance(&ledger, &a), balance(&ledger, &b)), (1000, 1000));
+        assert_eq!((balance(&ledger, &a), balance(&ledger, &b)), (0, 0)); // Still reserved for review.
     }
 
     #[test]
     fn cant_report_for_someone_else() {
         let (mut ledger, a, b) = setup();
-        assert!(ledger.submit_report(&a, &report(&a, &b, 1, Some(0)), &rules()).is_err());
+        assert!(
+            ledger
+                .submit_report(&a, &report(&a, &b, 1, Some(0)), &rules())
+                .is_err()
+        );
     }
 
     #[test]
     fn withdrawals_reserve_and_refund() {
         let (mut ledger, a, _) = setup();
-        let ok = ledger.reserve_withdrawal(&a, 500, 10, "inv1", "h1").unwrap();
+        let ok = ledger
+            .reserve_withdrawal(&a, 500, 10, "inv1", "h1")
+            .unwrap();
         assert_eq!(balance(&ledger, &a), 490);
         ledger.finish_withdrawal(&ok, Some(3), None).unwrap();
         assert_eq!(balance(&ledger, &a), 497);
 
-        let failed = ledger.reserve_withdrawal(&a, 400, 10, "inv2", "h2").unwrap();
-        ledger.finish_withdrawal(&failed, None, Some("no route")).unwrap();
-        ledger.finish_withdrawal(&failed, None, Some("no route")).unwrap();
+        let failed = ledger
+            .reserve_withdrawal(&a, 400, 10, "inv2", "h2")
+            .unwrap();
+        ledger
+            .finish_withdrawal(&failed, None, Some("no route"))
+            .unwrap();
+        ledger
+            .finish_withdrawal(&failed, None, Some("no route"))
+            .unwrap();
         assert_eq!(balance(&ledger, &a), 497);
 
-        assert!(ledger.reserve_withdrawal(&a, 400, 10, "inv1", "h1").is_err()); // Same invoice twice.
-        assert!(ledger.reserve_withdrawal(&a, 495, 10, "inv3", "h3").is_err()); // Not enough with fees.
+        assert!(
+            ledger
+                .reserve_withdrawal(&a, 400, 10, "inv1", "h1")
+                .is_err()
+        ); // Same invoice twice.
+        assert!(
+            ledger
+                .reserve_withdrawal(&a, 495, 10, "inv3", "h3")
+                .is_err()
+        ); // Not enough with fees.
     }
 }

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use sats_arena_protocol::{MatchReport, PROTOCOL_VERSION, Transfer, TransferReason};
 
-use crate::config::Rules;
+use crate::Rules;
 
 pub const MAX_HITS: usize = 20_000;
 const MAX_ID_LEN: usize = 128;
@@ -12,7 +12,10 @@ const MAX_ID_LEN: usize = 128;
 /// Checks a report is internally consistent before anything is stored.
 pub fn validate(report: &MatchReport) -> Result<(), String> {
     if report.protocol_version != PROTOCOL_VERSION {
-        return Err(format!("unsupported protocol version {}", report.protocol_version));
+        return Err(format!(
+            "unsupported protocol version {}",
+            report.protocol_version
+        ));
     }
     if report.match_id.is_empty() || report.match_id.len() > MAX_ID_LEN {
         return Err("invalid match_id".into());
@@ -25,7 +28,10 @@ pub fn validate(report: &MatchReport) -> Result<(), String> {
         if slot.port > 3 || std::mem::replace(&mut ports[slot.port as usize], true) {
             return Err(format!("invalid or repeated port {}", slot.port));
         }
-        if report.players[..i].iter().any(|p| p.player_id == slot.player_id) {
+        if report.players[..i]
+            .iter()
+            .any(|p| p.player_id == slot.player_id)
+        {
             return Err("the same player can't be on two ports".into());
         }
     }
@@ -40,7 +46,11 @@ pub fn validate(report: &MatchReport) -> Result<(), String> {
         return Err("too many hits".into());
     }
     for hit in &report.hits {
-        if !known(hit.victim_port) || hit.attacker_port.is_some_and(|a| !known(a) || a == hit.victim_port) {
+        if !known(hit.victim_port)
+            || hit
+                .attacker_port
+                .is_some_and(|a| !known(a) || a == hit.victim_port)
+        {
             return Err(format!("hit on frame {} has invalid ports", hit.frame));
         }
     }
@@ -49,9 +59,18 @@ pub fn validate(report: &MatchReport) -> Result<(), String> {
 
 /// Computes transfers for a validated report. Nobody can pay more than they
 /// have; transfers are capped at the payer's balance, in a fixed order.
-pub fn compute(report: &MatchReport, rules: &Rules, balances: &HashMap<String, u64>) -> Vec<Transfer> {
+pub fn compute(
+    report: &MatchReport,
+    rules: &Rules,
+    balances: &HashMap<String, u64>,
+) -> Vec<Transfer> {
     let id_of = |port: u8| -> &str {
-        &report.players.iter().find(|p| p.port == port).expect("validated port").player_id
+        &report
+            .players
+            .iter()
+            .find(|p| p.port == port)
+            .expect("validated port")
+            .player_id
     };
     let mut remaining = balances.clone();
     let mut transfers = Vec::new();
@@ -61,7 +80,12 @@ pub fn compute(report: &MatchReport, rules: &Rules, balances: &HashMap<String, u
         if sats > 0 {
             *balance -= sats;
             *remaining.entry(to.to_string()).or_default() += sats;
-            transfers.push(Transfer { from_player_id: from.into(), to_player_id: to.into(), sats, reason });
+            transfers.push(Transfer {
+                from_player_id: from.into(),
+                to_player_id: to.into(),
+                sats,
+                reason,
+            });
         }
     };
 
@@ -81,7 +105,12 @@ pub fn compute(report: &MatchReport, rules: &Rules, balances: &HashMap<String, u
         let mut losers: Vec<_> = report.players.iter().filter(|p| p.port != winner).collect();
         losers.sort_by_key(|p| p.port);
         for loser in losers {
-            pay(&loser.player_id, id_of(winner), rules.win_sats, TransferReason::Win);
+            pay(
+                &loser.player_id,
+                id_of(winner),
+                rules.win_sats,
+                TransferReason::Win,
+            );
         }
     }
     transfers
@@ -93,7 +122,12 @@ mod tests {
     use sats_arena_protocol::{Hit, MatchMode, PlayerSlot};
 
     fn rules() -> Rules {
-        Rules { sats_per_percent: 2, win_sats: 100, max_deposit_sats: 1_000_000, invoice_expiry_secs: 600 }
+        Rules {
+            sats_per_percent: 2,
+            win_sats: 100,
+            max_deposit_sats: 1_000_000,
+            invoice_expiry_secs: 600,
+        }
     }
 
     fn report(hits: Vec<Hit>, winner_port: Option<u8>) -> MatchReport {
@@ -103,8 +137,14 @@ mod tests {
             mode: MatchMode::Local,
             reporter_port: 0,
             players: vec![
-                PlayerSlot { port: 0, player_id: "a".into() },
-                PlayerSlot { port: 1, player_id: "b".into() },
+                PlayerSlot {
+                    port: 0,
+                    player_id: "a".into(),
+                },
+                PlayerSlot {
+                    port: 1,
+                    player_id: "b".into(),
+                },
             ],
             hits,
             winner_port,
@@ -112,7 +152,12 @@ mod tests {
     }
 
     fn hit(victim_port: u8, attacker_port: Option<u8>, damage_centi: u32) -> Hit {
-        Hit { frame: 0, victim_port, attacker_port, damage_centi }
+        Hit {
+            frame: 0,
+            victim_port,
+            attacker_port,
+            damage_centi,
+        }
     }
 
     fn balances(a: u64, b: u64) -> HashMap<String, u64> {
@@ -130,13 +175,21 @@ mod tests {
 
     #[test]
     fn unattributed_damage_is_free() {
-        let t = compute(&report(vec![hit(1, None, 5000)], None), &rules(), &balances(1000, 1000));
+        let t = compute(
+            &report(vec![hit(1, None, 5000)], None),
+            &rules(),
+            &balances(1000, 1000),
+        );
         assert!(t.is_empty());
     }
 
     #[test]
     fn payments_are_capped_at_balance() {
-        let t = compute(&report(vec![hit(1, Some(0), 10_000)], Some(0)), &rules(), &balances(0, 150));
+        let t = compute(
+            &report(vec![hit(1, Some(0), 10_000)], Some(0)),
+            &rules(),
+            &balances(0, 150),
+        );
         // b owes 200 for damage but only has 150, then has nothing left for the win.
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].sats, 150);
@@ -145,7 +198,11 @@ mod tests {
     #[test]
     fn winnings_received_can_be_paid_back_out() {
         // a takes 50% from b (owes 100), then wins and b pays 100 more.
-        let t = compute(&report(vec![hit(0, Some(1), 5000)], Some(1)), &rules(), &balances(150, 0));
+        let t = compute(
+            &report(vec![hit(0, Some(1), 5000)], Some(1)),
+            &rules(),
+            &balances(150, 0),
+        );
         let paid: u64 = t.iter().map(|t| t.sats).sum();
         assert_eq!(paid, 150);
     }

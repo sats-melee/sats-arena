@@ -1,4 +1,4 @@
-//! The only part of the server that touches Lightning. Each backend adapts one
+//! The only part of the engine that touches Lightning. Each backend adapts one
 //! way of reaching a node (NWC, LND, CLN, ...) to this interface.
 
 mod fake;
@@ -15,7 +15,10 @@ pub struct NewInvoice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvoiceState {
     Pending,
-    Paid,
+    /// The wallet, not the client, confirms a settled incoming payment.
+    Paid {
+        amount_sats: u64,
+    },
     Expired,
 }
 
@@ -29,18 +32,30 @@ pub struct DecodedInvoice {
 pub enum PaymentState {
     /// In flight, or the backend can't tell yet. Funds stay reserved.
     Pending,
-    Succeeded { fee_sats: u64 },
+    Succeeded {
+        fee_sats: u64,
+    },
     /// Only return this when the payment can never succeed later; the server
     /// refunds the player immediately.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 #[async_trait]
 pub trait Wallet: Send + Sync {
-    async fn create_invoice(&self, amount_sats: u64, memo: &str, expiry_secs: u64) -> anyhow::Result<NewInvoice>;
+    /// Create an ordinary receiving invoice. No hold-invoice support is needed.
+    async fn create_invoice(
+        &self,
+        amount_sats: u64,
+        memo: &str,
+        expiry_secs: u64,
+    ) -> anyhow::Result<NewInvoice>;
     async fn invoice_state(&self, payment_hash: &str) -> anyhow::Result<InvoiceState>;
     fn decode_invoice(&self, bolt11: &str) -> anyhow::Result<DecodedInvoice>;
     /// An `Err` means the outcome is unknown, not that the payment failed.
     async fn pay_invoice(&self, bolt11: &str, max_fee_sats: u64) -> anyhow::Result<PaymentState>;
+    /// A missing payment or lost response is Pending/unknown, NOT proof of
+    /// failure. Only Failed authorizes releasing a withdrawal's reserved funds.
     async fn payment_state(&self, payment_hash: &str) -> anyhow::Result<PaymentState>;
 }

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any breaking change to these types.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,7 +40,8 @@ pub struct Hit {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchReport {
     pub protocol_version: u32,
-    /// Slippi's match ID for netplay; a client-generated random ID for local.
+    /// Unique per game. A netplay host must coordinate this between clients
+    /// (e.g. session ID + game number); a matchmaking session ID alone is not enough.
     pub match_id: String,
     pub mode: MatchMode,
     /// The port the reporting account is playing on.
@@ -86,6 +87,45 @@ pub struct Account {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositRequest {
     pub amount_sats: u64,
+}
+
+/// Unique per game; the ID also makes repeated create requests retry-safe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyRequest {
+    pub id: String,
+    pub mode: MatchMode,
+    pub players: Vec<PlayerSlot>,
+    pub budget_sats: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LobbyPhase {
+    Funding,
+    Ready,
+    Playing,
+    Settled,
+    Cancelled,
+    Disputed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyPlayer {
+    pub port: u8,
+    pub player_id: String,
+    pub available_sats: u64,
+    pub reserved_sats: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lobby {
+    pub id: String,
+    pub mode: MatchMode,
+    pub phase: LobbyPhase,
+    pub budget_sats: u64,
+    pub sats_per_percent: u64,
+    pub win_sats: u64,
+    pub players: Vec<LobbyPlayer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,7 +188,9 @@ pub struct Transfer {
 pub enum MatchStatus {
     /// A netplay report was accepted; other players haven't reported yet.
     WaitingForOpponent,
-    Settled { transfers: Vec<Transfer> },
+    Settled {
+        transfers: Vec<Transfer>,
+    },
     /// Reports disagreed. Nothing moved; the operator has to resolve it.
     Disputed,
 }
@@ -169,10 +211,21 @@ mod tests {
             mode: MatchMode::Netplay,
             reporter_port,
             players: vec![
-                PlayerSlot { port: 0, player_id: "a".into() },
-                PlayerSlot { port: 1, player_id: "b".into() },
+                PlayerSlot {
+                    port: 0,
+                    player_id: "a".into(),
+                },
+                PlayerSlot {
+                    port: 1,
+                    player_id: "b".into(),
+                },
             ],
-            hits: vec![Hit { frame: 10, victim_port: 1, attacker_port: Some(0), damage_centi: 1200 }],
+            hits: vec![Hit {
+                frame: 10,
+                victim_port: 1,
+                attacker_port: Some(0),
+                damage_centi: 1200,
+            }],
             winner_port: Some(0),
         }
     }

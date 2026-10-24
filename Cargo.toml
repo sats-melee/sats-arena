@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["protocol", "server"]
+members = ["protocol", "core", "server", "local"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,5 +10,6 @@ repository = "https://github.com/landaverdend/sats-arena"
 
 [workspace.dependencies]
 sats-arena-protocol = { path = "protocol" }
+sats-arena-core = { path = "core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
