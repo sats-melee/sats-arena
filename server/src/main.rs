@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("using the fake wallet: no real sats are involved");
             Box::new(wallet::FakeWallet::default())
         }
+        WalletConfig::Nwc { .. } => anyhow::bail!("the nwc wallet backend isn't implemented yet; use backend = \"fake\""),
     };
 
     let state = Arc::new(AppState {

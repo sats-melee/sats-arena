@@ -16,5 +16,6 @@ max_deposit_sats = 100000
 invoice_expiry_secs = 600
 
 [wallet]
-# "fake" moves no real sats. NWC support is coming next.
+# "fake" moves no real sats. "nwc" (coming next) takes a connection string
+# here as nwc_uri, or from the SATS_ARENA_NWC_URI environment variable.
 backend = "fake"
