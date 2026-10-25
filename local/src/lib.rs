@@ -330,20 +330,11 @@ impl Demo {
         saved
             .used_payment_hashes
             .extend(saved.prepared.values().map(|p| p.payment_hash.clone()));
-        if saved.log_version == 0 {
-            // Old invoice/result strings have no timestamps. Retain them in the
-            // archive, but do not invent their position in the new timeline.
-            saved.activity = saved
-                .receipts
-                .iter()
-                .map(|r| Activity {
-                    at_ms: r.at_ms,
-                    message: receipt_message(r, saved.simulated),
-                })
-                .collect();
-            saved.activity.sort_by_key(|entry| entry.at_ms);
-            saved.log_version = 1;
-        }
+        // Activity is a per-application-session display. Financial receipts,
+        // prepared invoices and payout states remain durable for recovery.
+        saved.activity.clear();
+        saved.events.clear();
+        saved.log_version = 1;
         if saved.pot.phase == Phase::Funding && !saved.pot.paid.iter().any(|p| *p) {
             let rate = std::env::var("SATS_ARENA_SATS_PER_PERCENT").unwrap_or_else(|_| "1".into());
             let rate = rate

@@ -93,6 +93,6 @@ Protocol references:
 Invoice confirmations, damage receipts and results share one timestamped,
 oldest-to-newest timeline, with the latest entries at the bottom. Entries read
 `Player 1 Invoice Paid — 500 sats`. Payouts identify the receiving player,
-address, amount and reason. Historical payout timestamps are migrated; older
-invoice/result strings without timestamps remain in the saved archive rather
-than being assigned an invented time in the new display.
+address, amount and reason. Each application launch starts an empty activity log. Entries remain visible
+across matches in that session. Payment receipts and recovery state remain
+durable, so clearing the display never resends or loses a payment.

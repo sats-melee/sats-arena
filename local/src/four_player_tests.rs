@@ -491,7 +491,7 @@ fn schema_two_migration_preserves_two_player_funds_payout_ids_and_fractional_dam
 }
 
 #[test]
-fn activity_is_a_single_persistent_timeline_with_clear_invoice_labels() {
+fn activity_is_chronological_within_session_and_restart_starts_a_new_log() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
         let mut demo = Demo::open(dir.path()).await.unwrap();
@@ -528,9 +528,31 @@ fn activity_is_a_single_persistent_timeline_with_clear_invoice_labels() {
         );
         assert!(lines.lines().all(|line| line.as_bytes()[8] == b'Z'));
         assert!(!lines.contains("Entry P"));
+        let receipt_count = demo.saved.receipts.len();
+        let payout_ids = demo.saved.used_payment_hashes.clone();
+        let paid = demo.saved.pot.paid;
+        let invoices = demo.saved.invoices.clone();
         drop(demo);
-        let recovered = Demo::open(dir.path()).await.unwrap();
-        assert_eq!(log(&recovered), lines);
+        let mut recovered = Demo::open(dir.path()).await.unwrap();
+        assert!(log(&recovered).is_empty());
+        assert!(recovered.saved.activity.is_empty());
+        assert!(recovered.saved.events.is_empty());
+        assert_eq!(recovered.saved.receipts.len(), receipt_count);
+        assert_eq!(recovered.saved.used_payment_hashes, payout_ids);
+        assert_eq!(recovered.saved.pot.paid, paid);
+        assert_eq!(recovered.saved.invoices, invoices);
+        recovered.reconcile().await.unwrap();
+        assert!(log(&recovered).is_empty());
+        assert_eq!(recovered.simulation.as_ref().unwrap().payment_attempts(), 0);
+        recovered.command(Command::Action(4)).await.unwrap();
+        recovered.command(Command::Action(8)).await.unwrap();
+        recovered.reconcile().await.unwrap();
+        let new_log = log(&recovered);
+        assert!(new_log.contains("No contest"));
+        assert!(!new_log.contains("Invoice Paid"));
+        assert!(!new_log.contains("damage"));
+        assert_eq!(recovered.saved.receipts.len(), receipt_count + 2);
+        conserved(&recovered);
     });
 }
 
