@@ -1,12 +1,14 @@
 # Sats Arena payment engine
 
-The local game uses **two fresh invoice payments per match**, five-second damage-payout batches,
-and the remaining pot going to the winner. See [the payment rules](docs/match-payments.md).
+The local game supports **2–4 participants in free-for-all or team battles**.
+Every human verifies a Lightning Address and pays a fresh entry each match;
+CPUs neither fund nor receive payments. See [the payment rules](docs/match-payments.md).
 
-Defaults: 500 sats from each player, 10 sats per 1% credited damage. An 8% hit
-pays 80 sats after its five-second window, leaving 920 of the 1,000-sat pot for the winner.
-There are no reusable player balances, budget reservations or fixed win bonus
-in this flow. The next match always requires two new payments.
+Defaults: 500 sats per human, 10 sats per 1% attributed opponent damage.
+Damage steals from the victim's remaining contribution and pays the attacker
+in five-second batches. At match end, winners recover their own unspent funds
+and split all losing sides' remaining pots evenly among winning humans.
+Winnings never substitute for the next match's entry.
 
 **The embedded host currently simulates both incoming and outgoing payments.**
 Receiving addresses now receive live LNURL/BOLT11 verification in the sidebar.
@@ -20,7 +22,7 @@ prototype; their APIs below do not define the new match-sidebar UX.
 ## Layout
 
 - `protocol/`: wire types shared with the Dolphin client.
-- `core/`: the prepaid `pot::MatchPot` rules, plus the older engine, SQLite ledger, settlement, and wallet interface. No HTTP
+- `core/`: the four-slot prepaid `arena_pot::MatchPot` rules, plus the older engine, SQLite ledger, settlement, and wallet interface. No HTTP
   listener, Electron, or dependency on a specific node installation.
 - `server/`: a thin HTTP wrapper and host configuration for that same engine.
 - `local/`: fake-only C ABI host for Dolphin, with its own background worker.
@@ -38,11 +40,12 @@ and withdraws winnings by calling the engine directly. It opens no network
 listener and moves no real sats. The same crate can be linked into Dolphin
 through its existing Rust/C++ bridge on a background runtime.
 
-The native Dolphin build embeds the fake-only prepaid host in its sidebar.
-Melee boots immediately. Two QR codes appear at **PRESS START** and stay visible
-with a Paid label after confirmation. Finalized game credits trigger outgoing
-simulated payouts during play. The normal winner gets the remaining pot;
-then the next match creates two fresh entry invoices. See
+The native Dolphin build embeds the prepaid host in its scrollable sidebar.
+Melee boots immediately. Each active human has an address and Verify button,
+entry QR, funding status and pot. Start stays blocked until every human is
+verified and paid. Finalized, sequenced attacker/victim credits trigger batched
+simulated payouts; an authoritative team result drives settlement. Changing a
+funded roster returns entries before issuing new invoices. See
 `Ishiiruka/docs/LocalFundingPreview.md`.
 
 **Not wired yet:** launcher Local/Remote mode selection and the real NWC wallet

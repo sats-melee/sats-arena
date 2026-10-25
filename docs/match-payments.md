@@ -1,63 +1,61 @@
-# Per-match payments
+# Local match payments: 2–4 players, FFA and teams
 
-This is the intended local Arena payment model. It replaces the reusable-balance
-and budget-reservation UX. The remote balance/lobby API is an older prototype;
-it does not define the match-sidebar flow.
+The embedded game uses `arena_pot::MatchPot`. The older balance/server API and
+legacy two-slot pot are separate prototypes and do not define this flow.
 
-## Player experience
+Each active human verifies a receiving Lightning Address and funds a fresh entry
+(default 500 sats); CPUs require neither and have no financial pot. All humans
+must have fresh compatible verification and confirmed entries before Start.
+The CSS roster, mode and team IDs are bound to admission and checked again
+against the actual match-start setup. Changing a funded lobby settles returns
+before a new roster receives fresh invoices. The four player cards scroll.
 
-- At the local character-select **PRESS START** prompt, show two fresh invoice
-  QR codes: one for each player, for this match only.
-- Both players save their receiving Lightning Addresses, then pay the full entry
-  amount before Start unlocks. Prior winnings
-  never replace an entry invoice. A paid QR stays visible with a Paid label.
-- During play, finalized attributed damage accrues a payout to the attacker
-  from the victim's unspent entry funds. The first whole sat starts a five-second
-  window; later hits join without extending it. Each due batch is sent once. Display **Paid**, **Match funds left**, and **Sats earned**.
-  Do not present a reusable account balance or a Reserved label.
-- A normal winner receives all unspent funds from both entries, in addition to
-  anything earned during play. There is no separate fixed win bonus.
-- The next match always creates two new invoices and repeats this flow.
+## Damage and batches
 
-Initial configurable values: **500 sats per player**, **10 sats per 1% credited
-damage**. These are defaults, not the definition of the model.
+Finalized game credits carry attacker, victim, damage and an ordered sequence.
+Opponent damage steals from the victim's remaining contribution at the configured
+rate (default 10 sats per 1%). Self/environmental damage, friendly fire, CPU attacks
+and hits against CPUs transfer nothing. CPU/friendly observations still advance
+the sequence. Fractional sats accumulate per attacker/victim pair; victim funds
+cannot go negative. Ordered processing preserves which attacker exhausted a pot.
 
-## Accounting
+Each recipient's first whole sat starts a five-second deadline. Later hits join
+without extending it. Freeze each due batch under an immutable payout ID. New
+hits start a new batch even if an older outgoing payment remains unresolved.
+Duplicate credits are ignored; gaps are rejected before mutation. A missing or
+incomplete stream cannot authorize a winner payout.
 
-Each entry is a completed ordinary invoice payment. It is not a hold invoice.
-The host holds the unspent match pot until it has paid the recipients. Payouts
-are outgoing payments, not credits to a balance used to fund another match.
+## Results
 
-A damage payout consumes only the victim's remaining entry funds. Earnings do
-not refill the recipient's match funds and cannot be lost again. Payouts stop
-at zero; nobody is charged beyond the entry they paid. Fractional sat amounts
-accumulate per victim before rounding down to whole sats. Only finalized,
-attributed credits count; self/unattributed damage does not.
+Flush unbatched damage earnings into final settlement payments, retaining all
+previously frozen payout IDs. In FFA, return the winning human's own remainder
+and award all losers' remaining contributions to that player. In teams, return
+each winning human's own remainder and split all losing sides' remaining funds
+equally among all winning humans, including eliminated teammates. CPU teammates
+never take a share. Assign indivisible sats in ascending player-port order.
 
-Example: both players pay 500 sats. P1 deals 8% to P2, earning 80 sats. Remaining
-funds are P1=500, P2=420. If P2 wins, P2 receives the remaining 920 sats. Total
-payouts are P1=80, P2=920. The next match still requires two fresh 500-sat payments.
+CPU-only winning side, draw, no contest, interrupted game or incomplete data:
+keep accrued damage earnings and return unspent funds to their owners. There
+is no fixed victory bonus, reusable balance, or re-spending of damage earnings.
 
-For ties, no-contest, cancellation, or stopping emulation: retain payouts already
-earned and return each player's unspent contribution to that player. Do not
-invent a winner. An ambiguous/failed outgoing payment stays tracked and must
-not be paid twice or treated as available pot money.
+Example: four humans pay 500 sats each. P1 steals 232 from P2 during play.
+P1/P3 are Red and P2/P4 Blue. Blue wins: P1 keeps 232; P2 gets 268 of its own
+remaining entry plus 500 from Red; P4 gets 500 of its own plus 500 from Red.
+Final payouts: `[232,768,0,1000]`, totaling 2000 sats.
 
-The conservation rule is: paid entries = unspent match funds + confirmed payouts
-+ payouts owed/in flight. Routing fees require a separate operator policy and
-are not silently deducted from this advertised pot.
+## Persistence and wallet boundary
 
-## Integration and current limits
+The host persists received entries, ordered credits, recipient-bound invoices,
+payout intent and confirmation. A recovered InFlight payment is looked up and
+never blindly resent. An unresolved return blocks new funding. Schema 2 local
+state migrates from two slots while retaining funds, payout IDs and fractional
+carry. Completed games are archived before creating the next pot.
 
-The gate remains at PRESS START. Game credits feed the payment worker during
-play; game-end placements select the recipient of the leftover pot. Payouts use
-stable IDs and durable state before calling a wallet. Replayed events, duplicate
-end messages, and worker restarts must not produce duplicate payouts.
+The wallet/provider interfaces are independent of NWC or another backend.
+The GUI currently uses simulated funding and outgoing payments; receiving
+verification alone uses live LNURL/BOLT11. No real sats move in gameplay tests.
+Fees belong to the wallet execution budget, outside the advertised match pots.
 
-The current local host has a fake wallet. Test invoices and test outgoing
-payments must be clearly labelled as simulated. Real use requires an outgoing
-wallet adapter and a configured receiving destination for each player; drawing
-a QR or updating a counter is not proof of an outgoing Lightning payment.
-
-Detailed timing, address locking, receipt logging and wallet-adapter contracts:
-[Five-second payouts](batched-payouts.md).
+At every transition, contributed sats equal remaining contributions plus open
+or pending payouts plus confirmed payouts. See [batch contracts](batched-payouts.md)
+and native `Ishiiruka/docs/evidence/four-player-payments/` for live evidence.

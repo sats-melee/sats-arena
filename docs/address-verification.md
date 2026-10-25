@@ -1,7 +1,7 @@
 # Receiving-address verification
 
 Each address has its own **Verify** button that performs a live receiving
-check independently of the funding wallet and the other player's address. Both players need a current,
+check independently of the funding wallet and the other player's address. All participating humans need a current,
 compatible result before entry QR codes are displayed or funding is accepted.
 
 For each address, the background worker:
@@ -18,7 +18,7 @@ No payment is sent. Verification does not establish ownership of the address,
 prove successful routing, or guarantee that a later payment will succeed.
 Each eventual payout requests and validates a fresh invoice.
 
-A red message at the top blocks match start until both current addresses are
+A red message at the top blocks match start until every current human address is
 verified. Editing one address invalidates only its displayed verification.
 
 ## Sidebar states
@@ -29,7 +29,7 @@ verified. Editing one address invalidates only its displayed verification.
 - **Failed**: provider/network/protocol error shown beside that player.
 - **Expired**: more than ten minutes since verification; verify again.
 - **Incompatible**: receiving limits cannot cover one-sat batches through the
-  complete current match pot. Funding stays disabled.
+  complete current match pot (human contributions only). Funding stays disabled.
 
 Changing an input hides the old verification and entry QR codes until checked
 again. After the first entry payment, addresses stay locked; the same addresses

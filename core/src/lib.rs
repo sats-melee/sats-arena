@@ -1,6 +1,7 @@
 //! One payment engine, two hosts: embedded in Dolphin or wrapped by an HTTP server.
 //!
-//! The local match sidebar uses `pot::MatchPot`: fresh entries, live outgoing
+//! The local match sidebar uses `arena_pot::MatchPot`: up to four players, fresh
+//! entries, live outgoing
 //! payouts and the leftover pot to the winner. No reusable player balances.
 //!
 //! The older `Engine` balance API below remains for the remote prototype.
@@ -11,6 +12,7 @@
 //! Run this engine on a background Tokio runtime, NOT on Dolphin's emulation
 //! thread. Its bounded command queue serializes wallet and ledger operations.
 
+pub mod arena_pot;
 mod engine;
 mod ledger;
 mod lobby;

@@ -11,7 +11,7 @@ minimum amount beyond the one-sat granularity of the accounting.
 
 At the deadline, freeze the batch into an immutable payout ID and submit it.
 Damage at or after that cutoff starts another batch, even while the previous
-payment is in flight. The two recipients have independent deadlines.
+payment is in flight. Recipients have independent deadlines.
 Scheduling runs on the background worker; it does not pause emulation.
 
 On match end, combine each recipient's still-open earnings with their final
@@ -26,11 +26,12 @@ once, without restarting the timer or duplicating the batch.
 ## Receiving addresses
 
 Each player enters a Lightning Address such as `alice@example.com`.
-Both addresses must be syntactically valid and saved before entry invoices
-are displayed or entry payments can be simulated. Domains are normalized to
+Every participating human must have a current compatible live receiver check
+before entry invoices are displayed or entry payments can be simulated. CPUs
+require no address. Domains are normalized to
 lowercase; addresses persist across games and application restarts.
 
-Recipients are locked as soon as either entry payment is confirmed. New
+Recipients are locked as soon as any entry payment is confirmed. New
 recipients can be saved before paying for the next match. A prepared payout
 retains its original recipient even if a later match uses different addresses.
 
@@ -45,7 +46,7 @@ The shared Rust core exposes independent interfaces:
 
 | Interface | Responsibility |
 | --- | --- |
-| `pot::MatchPot` | Account for damage, close timed batches, allocate the final pot; no networking |
+| `arena_pot::MatchPot` | Account for damage, close timed batches, allocate the final pot; no networking |
 | `wallet::AddressInvoices` | Resolve a receiving address into an exact-amount invoice |
 | `wallet::Wallet` | Create/confirm entry invoices, decode outgoing invoices, submit payments, look up outcomes |
 
