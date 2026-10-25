@@ -136,3 +136,20 @@ impl Wallet for FakeWallet {
 fn hash(bolt11: &str) -> String {
     hex::encode(Sha256::digest(bolt11.as_bytes()))
 }
+
+/// Explicitly simulated address provider; never contacts the supplied domain.
+pub struct FakeAddressInvoices;
+#[async_trait]
+impl super::AddressInvoices for FakeAddressInvoices {
+    async fn invoice(
+        &self,
+        address: &super::LightningAddress,
+        sats: u64,
+        id: &str,
+    ) -> anyhow::Result<String> {
+        Ok(format!(
+            "lnfake:{sats}:recipient-{}-{id}",
+            hex::encode(address.as_str())
+        ))
+    }
+}

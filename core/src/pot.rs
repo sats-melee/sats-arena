@@ -26,6 +26,7 @@ pub enum Reason {
     Damage,
     WinnerPot,
     Return,
+    Settlement,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,10 @@ pub struct MatchPot {
     pub damage_centi: [u64; 2],
     pub payouts: Vec<Payout>,
     pub outcome: Option<Outcome>,
+    #[serde(default)]
+    pub unbatched: [u64; 2],
+    #[serde(default)]
+    pub batch_deadline_ms: [Option<u64>; 2],
 }
 
 impl MatchPot {
@@ -78,6 +83,8 @@ impl MatchPot {
             damage_centi: [0; 2],
             payouts: vec![],
             outcome: None,
+            unbatched: [0; 2],
+            batch_deadline_ms: [None; 2],
         })
     }
 
@@ -114,12 +121,15 @@ impl MatchPot {
 
     /// Cumulative counters make retries and missed UI polls safe. A stale total
     /// cannot undo or duplicate an already planned payout.
-    pub fn credit(&mut self, totals: [u64; 2]) -> Result<()> {
+    /// Clock is injected; durable hosts use Unix milliseconds so deadlines survive restart.
+    /// A later hit never extends the first hit's five-second deadline.
+    pub fn credit_at(&mut self, totals: [u64; 2], now_ms: u64) -> Result<()> {
         if self.phase != Phase::Playing {
             return Err(Error::Rejected(
                 "damage payouts require a playing match".into(),
             ));
         }
+        self.flush_due(now_ms);
         for (victim, &total) in totals.iter().enumerate() {
             if total <= self.damage_centi[victim] {
                 continue;
@@ -132,9 +142,24 @@ impl MatchPot {
             let paid = owed.min(self.remaining[victim]);
             self.damage_centi[victim] = total;
             self.remaining[victim] -= paid;
-            self.payout(1 - victim, paid, Reason::Damage);
+            if paid != 0 {
+                let recipient = 1 - victim;
+                self.unbatched[recipient] += paid;
+                self.batch_deadline_ms[recipient].get_or_insert(now_ms.saturating_add(5_000));
+            }
         }
         Ok(())
+    }
+
+    /// Freeze due batches. New damage will accumulate under a new immutable payout ID.
+    pub fn flush_due(&mut self, now_ms: u64) {
+        for player in 0..2 {
+            if self.batch_deadline_ms[player].is_some_and(|deadline| now_ms >= deadline) {
+                let sats = std::mem::take(&mut self.unbatched[player]);
+                self.batch_deadline_ms[player] = None;
+                self.payout(player, sats, Reason::Damage);
+            }
+        }
     }
 
     fn payout(&mut self, player: usize, sats: u64, reason: Reason) {
@@ -169,12 +194,17 @@ impl MatchPot {
         }
         self.outcome = Some(outcome);
         let remaining = std::mem::take(&mut self.remaining);
+        let mut final_sats = std::mem::take(&mut self.unbatched);
+        self.batch_deadline_ms = [None; 2];
         if let Some(player) = winner {
-            self.payout(player, remaining[0] + remaining[1], Reason::WinnerPot);
+            final_sats[player] += remaining[0] + remaining[1];
         } else {
-            for (player, sats) in remaining.into_iter().enumerate() {
-                self.payout(player, sats, Reason::Return);
+            for player in 0..2 {
+                final_sats[player] += remaining[player];
             }
+        }
+        for (player, sats) in final_sats.into_iter().enumerate() {
+            self.payout(player, sats, Reason::Settlement);
         }
         self.phase = Phase::Settling;
         self.update_phase();
@@ -207,7 +237,7 @@ impl MatchPot {
     }
 
     pub fn pending(&self) -> [u64; 2] {
-        let mut pending = [0; 2];
+        let mut pending = self.unbatched;
         for payout in &self.payouts {
             if payout.state != PayoutState::Paid {
                 pending[payout.player] += payout.sats;
@@ -239,6 +269,7 @@ mod tests {
         pot.start().unwrap();
     }
     fn pay(pot: &mut MatchPot) {
+        pot.flush_due(u64::MAX);
         for index in 0..pot.payouts.len() {
             if pot.payouts[index].state == PayoutState::Created {
                 pot.begin_payout(index).unwrap();
@@ -256,10 +287,62 @@ mod tests {
     }
 
     #[test]
+    fn five_second_window_groups_hits_without_extending_deadline() {
+        let mut p = pot();
+        fund(&mut p);
+        p.credit_at([0, 200], 1_000).unwrap();
+        p.credit_at([0, 500], 4_999).unwrap();
+        assert_eq!(p.unbatched, [50, 0]);
+        assert_eq!(p.batch_deadline_ms, [Some(6_000), None]);
+        p.flush_due(5_999);
+        assert!(p.payouts.is_empty());
+        p.credit_at([0, 800], 6_000).unwrap();
+        assert_eq!(p.payouts[0].sats, 50);
+        assert_eq!(p.unbatched, [30, 0]);
+        assert_eq!(p.batch_deadline_ms[0], Some(11_000));
+        p.flush_due(11_000);
+        assert_eq!(p.payouts[1].sats, 30);
+        conserved(&p);
+    }
+
+    #[test]
+    fn independent_recipient_windows_and_end_flush_without_minimum_amount() {
+        let mut p = pot();
+        fund(&mut p);
+        p.credit_at([0, 10], 100).unwrap(); // P1 earns only one sat.
+        p.credit_at([100, 10], 200).unwrap();
+        assert_eq!(p.batch_deadline_ms, [Some(5_100), Some(5_200)]);
+        p.finish(Some(0)).unwrap();
+        // Winner receives unbatched damage + remainder in one settlement payment.
+        assert_eq!(p.payouts.len(), 2);
+        assert_eq!(p.payouts[0].sats, 990);
+        assert_eq!(p.payouts[1].sats, 10);
+        assert_eq!(p.batch_deadline_ms, [None; 2]);
+        pay(&mut p);
+        conserved(&p);
+    }
+
+    #[test]
+    fn open_window_recovers_with_original_deadline_and_no_duplicate_batch() {
+        let mut p = pot();
+        fund(&mut p);
+        p.credit_at([0, 800], 1_000).unwrap();
+        let mut recovered: MatchPot =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        recovered.flush_due(5_999);
+        assert!(recovered.payouts.is_empty());
+        recovered.flush_due(6_000);
+        recovered.flush_due(9_000);
+        assert_eq!(recovered.payouts.len(), 1);
+        assert_eq!(recovered.payouts[0].sats, 80);
+        conserved(&recovered);
+    }
+
+    #[test]
     fn live_damage_then_winner_receives_all_leftovers() {
         let mut p = pot();
         fund(&mut p);
-        p.credit([0, 800]).unwrap();
+        p.credit_at([0, 800], 0).unwrap();
         assert_eq!(p.remaining, [500, 420]);
         assert_eq!(p.pending(), [80, 0]);
         conserved(&p);
@@ -281,9 +364,10 @@ mod tests {
         let mut p = pot();
         fund(&mut p);
         for totals in [[0, 800], [0, 800], [0, 700]] {
-            p.credit(totals).unwrap();
+            p.credit_at(totals, 0).unwrap();
         }
-        assert_eq!(p.payouts.len(), 1);
+        assert!(p.payouts.is_empty());
+        assert_eq!(p.unbatched, [80, 0]);
         pay(&mut p);
         p.confirm_payout(0).unwrap();
         assert_eq!(p.earned, [80, 0]);
@@ -299,9 +383,9 @@ mod tests {
     fn funds_are_capped_and_winnings_cannot_be_spent_again() {
         let mut p = pot();
         fund(&mut p);
-        p.credit([0, 9000]).unwrap();
+        p.credit_at([0, 9000], 0).unwrap();
         pay(&mut p);
-        p.credit([9000, 99999]).unwrap();
+        p.credit_at([9000, 99999], 0).unwrap();
         pay(&mut p);
         assert_eq!(p.remaining, [0, 0]);
         assert_eq!(p.earned, [500, 500]);
@@ -314,9 +398,9 @@ mod tests {
     fn tiny_hits_accumulate_and_no_contest_returns_unspent_funds() {
         let mut p = pot();
         fund(&mut p);
-        p.credit([0, 5]).unwrap();
+        p.credit_at([0, 5], 0).unwrap();
         assert!(p.payouts.is_empty());
-        p.credit([0, 10]).unwrap();
+        p.credit_at([0, 10], 0).unwrap();
         pay(&mut p);
         assert_eq!(p.earned, [1, 0]);
         p.finish(None).unwrap();
@@ -334,7 +418,8 @@ mod tests {
     fn durable_inflight_payments_cannot_be_submitted_again() {
         let mut p = pot();
         fund(&mut p);
-        p.credit([0, 800]).unwrap();
+        p.credit_at([0, 800], 0).unwrap();
+        p.flush_due(5_000);
         p.begin_payout(0).unwrap();
         let mut recovered: MatchPot =
             serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();

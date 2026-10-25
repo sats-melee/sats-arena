@@ -1,15 +1,17 @@
 # Sats Arena payment engine
 
-The local game uses **two fresh invoice payments per match**, live hit payouts,
+The local game uses **two fresh invoice payments per match**, five-second damage-payout batches,
 and the remaining pot going to the winner. See [the payment rules](docs/match-payments.md).
 
 Defaults: 500 sats from each player, 10 sats per 1% credited damage. An 8% hit
-pays 80 sats during play, leaving 920 of the 1,000-sat pot for the winner.
+pays 80 sats after its five-second window, leaving 920 of the 1,000-sat pot for the winner.
 There are no reusable player balances, budget reservations or fixed win bonus
 in this flow. The next match always requires two new payments.
 
 **The embedded host currently simulates both incoming and outgoing payments.**
-It has no real-wallet adapter or real player payout destinations.
+Receiving-address inputs and a confirmed-payment log are implemented; real wallet
+and Lightning Address network adapters remain to be connected.
+See [batch timing and adapter contracts](docs/batched-payouts.md).
 
 The older account/balance engine and HTTP server remain available as a separate
 prototype; their APIs below do not define the new match-sidebar UX.

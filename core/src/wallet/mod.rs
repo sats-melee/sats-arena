@@ -1,11 +1,13 @@
 //! The only part of the engine that touches Lightning. Each backend adapts one
 //! way of reaching a node (NWC, LND, CLN, ...) to this interface.
 
+mod address;
 mod fake;
+pub use address::{AddressInvoices, LightningAddress, PreparedPayout, prepare_payout};
 
 use async_trait::async_trait;
 
-pub use fake::FakeWallet;
+pub use fake::{FakeAddressInvoices, FakeWallet};
 
 pub struct NewInvoice {
     pub bolt11: String,

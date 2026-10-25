@@ -8,10 +8,12 @@ it does not define the match-sidebar flow.
 
 - At the local character-select **PRESS START** prompt, show two fresh invoice
   QR codes: one for each player, for this match only.
-- Both players pay the full entry amount before Start unlocks. Prior winnings
+- Both players save their receiving Lightning Addresses, then pay the full entry
+  amount before Start unlocks. Prior winnings
   never replace an entry invoice. A paid QR stays visible with a Paid label.
-- During play, finalized attributed damage pays the attacker from the victim's
-  unspent entry funds. Display **Paid**, **Match funds left**, and **Sats earned**.
+- During play, finalized attributed damage accrues a payout to the attacker
+  from the victim's unspent entry funds. The first whole sat starts a five-second
+  window; later hits join without extending it. Each due batch is sent once. Display **Paid**, **Match funds left**, and **Sats earned**.
   Do not present a reusable account balance or a Reserved label.
 - A normal winner receives all unspent funds from both entries, in addition to
   anything earned during play. There is no separate fixed win bonus.
@@ -56,3 +58,6 @@ The current local host has a fake wallet. Test invoices and test outgoing
 payments must be clearly labelled as simulated. Real use requires an outgoing
 wallet adapter and a configured receiving destination for each player; drawing
 a QR or updating a counter is not proof of an outgoing Lightning payment.
+
+Detailed timing, address locking, receipt logging and wallet-adapter contracts:
+[Five-second payouts](batched-payouts.md).
