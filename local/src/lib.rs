@@ -60,11 +60,16 @@ pub struct LocalView {
     pub roster_configured: u32,
     pub last_credit_sequence: u64,
     pub sandbox: u32,
+    pub batch_window_ms: u64,
+    pub surcharge_bps: u32,
+    pub invoice_sats: u64,
+    pub surcharge_sats: u64,
+    pub collected_fee_sats: u64,
 }
 impl Default for LocalView {
     fn default() -> Self {
         Self {
-            abi_version: 6,
+            abi_version: 7,
             phase: 0,
             busy: 1,
             simulated: 1,
@@ -92,6 +97,11 @@ impl Default for LocalView {
             roster_configured: 0,
             last_credit_sequence: 0,
             sandbox: 0,
+            batch_window_ms: 5_000,
+            surcharge_bps: 0,
+            invoice_sats: 500,
+            surcharge_sats: 0,
+            collected_fee_sats: 0,
         }
     }
 }
@@ -148,6 +158,8 @@ struct Saved {
     simulated: bool,
     #[serde(default)]
     verification: [AddressCheck; 4],
+    #[serde(default)]
+    verified_addresses: BTreeMap<String, AddressVerification>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct RetiredEntry {
@@ -277,6 +289,15 @@ impl Demo {
             setting("SATS_ARENA_ENTRY_SATS", 500)?,
             setting("SATS_ARENA_SATS_PER_PERCENT", 1)?,
         )?;
+        pot.set_batch_window_ms(
+            setting("SATS_ARENA_BATCH_SECONDS", 5)?
+                .checked_mul(1000)
+                .ok_or_else(|| Error::Rejected("invalid payout delay".into()))?,
+        )?;
+        pot.set_surcharge_bps(
+            u32::try_from(setting("SATS_ARENA_SURCHARGE_BPS", 0)?)
+                .map_err(|_| Error::Rejected("invalid routing surcharge".into()))?,
+        )?;
         if let Some(roster) = roster {
             pot.configure(roster.teams, roster.kinds, roster.team_ids)?;
         }
@@ -287,7 +308,7 @@ impl Demo {
                 continue;
             }
             let invoice = wallet
-                .create_invoice(pot.entry_sats, &format!("{} P{}", pot.id, i + 1), 600)
+                .create_invoice(pot.invoice_sats(), &format!("{} P{}", pot.id, i + 1), 600)
                 .await?;
             invoices[i] = invoice.bolt11;
             hashes[i] = invoice.payment_hash;
@@ -311,6 +332,7 @@ impl Demo {
             receipts: vec![],
             simulated,
             verification: Default::default(),
+            verified_addresses: BTreeMap::new(),
             max_fee_sats: setting("SATS_ARENA_MAX_PAYOUT_FEE_SATS", default_fee_limit())?,
         })
     }
@@ -563,18 +585,36 @@ impl Demo {
             };
             let entry = setting("SATS_ARENA_ENTRY_SATS", demo.saved.pot.entry_sats)?;
             let rate = setting("SATS_ARENA_SATS_PER_PERCENT", 1)?;
-            demo.update_unfunded_settings(entry, rate).await?;
+            let batch_ms = setting("SATS_ARENA_BATCH_SECONDS", 5)?
+                .checked_mul(1000)
+                .ok_or_else(|| Error::Rejected("invalid payout delay".into()))?;
+            let surcharge_bps = u32::try_from(setting("SATS_ARENA_SURCHARGE_BPS", 0)?)
+                .map_err(|_| Error::Rejected("invalid routing surcharge".into()))?;
+            demo.update_unfunded_settings(entry, rate, batch_ms, surcharge_bps)
+                .await?;
         }
         demo.save()?;
         Ok(demo)
     }
-    async fn update_unfunded_settings(&mut self, entry: u64, rate: u64) -> Result<()> {
+    async fn update_unfunded_settings(
+        &mut self,
+        entry: u64,
+        rate: u64,
+        batch_ms: u64,
+        surcharge_bps: u32,
+    ) -> Result<()> {
         // Never rewrite an agreement after even one player's entry was paid.
         if self.saved.pot.phase != Phase::Funding || self.saved.pot.paid.iter().any(|p| *p) {
             return Ok(());
         }
-        MatchPot::new("settings".into(), entry, rate)?;
-        if self.saved.pot.entry_sats == entry && self.saved.pot.sats_per_percent == rate {
+        let mut terms = MatchPot::new("settings".into(), entry, rate)?;
+        terms.set_batch_window_ms(batch_ms)?;
+        terms.set_surcharge_bps(surcharge_bps)?;
+        if self.saved.pot.entry_sats == entry
+            && self.saved.pot.sats_per_percent == rate
+            && self.saved.pot.batch_window_ms == batch_ms
+            && self.saved.pot.surcharge_bps == surcharge_bps
+        {
             return Ok(());
         }
         // Retire at the old amount, so a late payment is returned to its original
@@ -583,13 +623,15 @@ impl Demo {
         self.save()?;
         self.saved.pot.entry_sats = entry;
         self.saved.pot.sats_per_percent = rate;
+        self.saved.pot.set_batch_window_ms(batch_ms)?;
+        self.saved.pot.set_surcharge_bps(surcharge_bps)?;
         if self.simulation.is_some() {
             for player in 0..4 {
                 if self.saved.pot.kinds[player] == 0 {
                     let invoice = self
                         .wallet
                         .create_invoice(
-                            entry,
+                            self.saved.pot.invoice_sats(),
                             &format!("{} P{}", self.saved.pot.id, player + 1),
                             600,
                         )
@@ -653,6 +695,77 @@ impl Demo {
                     .saturating_mul(humans)
                     .saturating_mul(1000)
     }
+    async fn verify_receiver(&self, address: &LightningAddress) -> AddressCheck {
+        // Cache capability checks, never payable invoices. Re-check compatibility
+        // against this roster and pot, even when the address was seen before.
+        let cached = self
+            .saved
+            .verified_addresses
+            .get(address.as_str())
+            .into_iter()
+            .chain(
+                self.saved
+                    .verification
+                    .iter()
+                    .filter_map(|check| check.report.as_ref()),
+            )
+            .find(|report| {
+                report.address == address.as_str()
+                    && report.fresh(now_ms())
+                    && self.supports_report(report)
+            });
+        if let Some(report) = cached {
+            return AddressCheck {
+                report: Some(report.clone()),
+                error: String::new(),
+            };
+        }
+        match tokio::time::timeout(Duration::from_secs(20), self.verifier.verify(address)).await {
+            Ok(Ok(report)) if report.address == address.as_str() => AddressCheck {
+                report: Some(report),
+                error: String::new(),
+            },
+            Ok(Ok(_)) => AddressCheck {
+                report: None,
+                error: "Verification returned a different receiving address".into(),
+            },
+            Ok(Err(error)) => AddressCheck {
+                report: None,
+                error: format!("{error:#}"),
+            },
+            Err(_) => AddressCheck {
+                report: None,
+                error: "Address verification timed out; try again".into(),
+            },
+        }
+    }
+    fn remember_receiver(&mut self, player: usize) {
+        let address = self.saved.addresses[player].clone();
+        self.saved
+            .verified_addresses
+            .retain(|_, report| report.fresh(now_ms()));
+        if let Some(report) = self.saved.verification[player]
+            .report
+            .as_ref()
+            .filter(|report| report.address == address && report.fresh(now_ms()))
+        {
+            self.saved
+                .verified_addresses
+                .insert(address, report.clone());
+        } else {
+            self.saved.verified_addresses.remove(&address);
+        }
+        while self.saved.verified_addresses.len() > 128 {
+            let oldest = self
+                .saved
+                .verified_addresses
+                .iter()
+                .min_by_key(|(_, report)| report.checked_at_ms)
+                .map(|(address, _)| address.clone())
+                .unwrap();
+            self.saved.verified_addresses.remove(&oldest);
+        }
+    }
     async fn next_match(&mut self, roster: Option<Roster>) -> Result<()> {
         self.retire_entries();
         self.save()?;
@@ -669,6 +782,7 @@ impl Demo {
         next.roster = roster;
         next.addresses = self.saved.addresses.clone();
         next.verification = self.saved.verification.clone();
+        next.verified_addresses = self.saved.verified_addresses.clone();
         next.receipts = self.saved.receipts.clone();
         next.events = self.saved.events.clone();
         next.activity = self.saved.activity.clone();
@@ -745,25 +859,8 @@ impl Demo {
                 self.saved.addresses[player] = address.as_str().into();
                 self.saved.verification[player] = AddressCheck::default();
                 self.save()?;
-                self.saved.verification[player] = match tokio::time::timeout(
-                    Duration::from_secs(20),
-                    self.verifier.verify(&address),
-                )
-                .await
-                {
-                    Ok(Ok(report)) => AddressCheck {
-                        report: Some(report),
-                        error: String::new(),
-                    },
-                    Ok(Err(error)) => AddressCheck {
-                        report: None,
-                        error: format!("{error:#}"),
-                    },
-                    Err(_) => AddressCheck {
-                        report: None,
-                        error: "Address verification timed out; try again".into(),
-                    },
-                };
+                self.saved.verification[player] = self.verify_receiver(&address).await;
+                self.remember_receiver(player);
             }
             Command::Addresses(addresses) => {
                 let first = parse_address(&addresses[0])?;
@@ -784,34 +881,12 @@ impl Demo {
                 self.saved.verification[0] = AddressCheck::default();
                 self.saved.verification[1] = AddressCheck::default();
                 self.save()?; // Never leave old verification attached to edited addresses.
-                let verifier = self.verifier.clone();
-                let check = |address: LightningAddress| {
-                    let verifier = verifier.clone();
-                    async move {
-                        match tokio::time::timeout(
-                            Duration::from_secs(20),
-                            verifier.verify(&address),
-                        )
-                        .await
-                        {
-                            Ok(Ok(report)) => AddressCheck {
-                                report: Some(report),
-                                error: String::new(),
-                            },
-                            Ok(Err(error)) => AddressCheck {
-                                report: None,
-                                error: format!("{error:#}"),
-                            },
-                            Err(_) => AddressCheck {
-                                report: None,
-                                error: "Address verification timed out; try again".into(),
-                            },
-                        }
-                    }
-                };
-                let (first, second) = tokio::join!(check(first), check(second));
+                let (first, second) =
+                    tokio::join!(self.verify_receiver(&first), self.verify_receiver(&second));
                 self.saved.verification[0] = first;
                 self.saved.verification[1] = second;
+                self.remember_receiver(0);
+                self.remember_receiver(1);
             }
             Command::Action(action) => match action {
                 1 => {
@@ -864,7 +939,7 @@ impl Demo {
                             .set_invoice_state(
                                 &self.saved.hashes[player],
                                 InvoiceState::Paid {
-                                    amount_sats: self.saved.pot.entry_sats,
+                                    amount_sats: self.saved.pot.invoice_sats(),
                                 },
                             );
                     }
@@ -969,7 +1044,7 @@ impl Demo {
             } else {
                 address
             },
-            expected_sats: self.saved.pot.entry_sats,
+            expected_sats: self.saved.pot.invoice_sats(),
             received_sats,
             prepared: None,
             state: PayoutState::Created,
@@ -999,7 +1074,7 @@ impl Demo {
             let invoice = tokio::time::timeout(
                 Duration::from_secs(15),
                 self.wallet.create_invoice(
-                    self.saved.pot.entry_sats,
+                    self.saved.pot.invoice_sats(),
                     &format!("{} Player {}", self.saved.pot.id, player + 1),
                     600,
                 ),
@@ -1186,7 +1261,7 @@ impl Demo {
                 {
                     InvoiceState::Paid { amount_sats } => {
                         // Account for received money before any verification or amount gate.
-                        if amount_sats != self.saved.pot.entry_sats
+                        if amount_sats != self.saved.pot.invoice_sats()
                             || (!self.saved.invoice_addresses[player].is_empty()
                                 && self.saved.invoice_addresses[player]
                                     != self.saved.addresses[player])
@@ -1197,9 +1272,11 @@ impl Demo {
                         }
                         self.saved.pot.confirm_entry(player, amount_sats)?;
                         self.event(format!(
-                            "Player {} Invoice Paid — {} sats",
+                            "Player {} Invoice Paid — {} sats ({} pot + {} fees)",
                             player + 1,
-                            amount_sats
+                            amount_sats,
+                            self.saved.pot.entry_sats,
+                            self.saved.pot.surcharge_sats()
                         ));
                         self.save()?;
                     }
@@ -1347,8 +1424,15 @@ impl Demo {
             simulated: u32::from(self.simulation.is_some()),
             sandbox: u32::from(self.sandbox_players.is_some()),
             entry_sats: pot.entry_sats,
+            batch_window_ms: pot.batch_window_ms,
+            surcharge_bps: pot.surcharge_bps,
+            invoice_sats: pot.invoice_sats(),
+            surcharge_sats: pot.surcharge_sats(),
+            collected_fee_sats: pot.collected_fee_sats(),
             sats_per_percent: pot.sats_per_percent,
-            paid_sats: pot.paid.map(|paid| if paid { pot.entry_sats } else { 0 }),
+            paid_sats: pot
+                .paid
+                .map(|paid| if paid { pot.invoice_sats() } else { 0 }),
             remaining_sats: pot.remaining,
             earned_sats: pot.earned,
             pending_sats: pot.pending(),
@@ -1883,7 +1967,9 @@ mod tests {
             let mut demo = Demo::open(dir.path()).await.unwrap();
             let old_hash = demo.saved.hashes[0].clone();
             demo.saved.addresses[0] = "alice@example.test".into();
-            demo.update_unfunded_settings(400, 2).await.unwrap();
+            demo.update_unfunded_settings(400, 2, 5_000, 0)
+                .await
+                .unwrap();
             assert_eq!(demo.saved.pot.entry_sats, 400);
             assert_eq!(demo.saved.pot.sats_per_percent, 2);
             let old = demo
@@ -1915,12 +2001,136 @@ mod tests {
             let mut demo = Demo::open(dir.path()).await.unwrap();
             demo.saved.pot.confirm_entry(0, 500).unwrap();
             let invoices = demo.saved.invoices.clone();
-            demo.update_unfunded_settings(400, 2).await.unwrap();
+            demo.update_unfunded_settings(400, 2, 5_000, 0)
+                .await
+                .unwrap();
             assert_eq!(demo.saved.pot.entry_sats, 500);
             assert_eq!(demo.saved.pot.sats_per_percent, 1);
             assert_eq!(demo.saved.invoices, invoices);
             assert!(demo.saved.retired_entries.is_empty());
         });
+    }
+
+    #[test]
+    fn receiver_cache_survives_rounds_ports_and_restart_but_expires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingVerifier(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl AddressVerifier for CountingVerifier {
+            async fn verify(
+                &self,
+                address: &LightningAddress,
+            ) -> anyhow::Result<AddressVerification> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                TestVerifier.verify(address).await
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut demo = Demo::open(dir.path()).await.unwrap();
+                demo.verifier = Arc::new(CountingVerifier(calls.clone()));
+                demo.command(Command::Address(0, "alice@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                demo.next_match(None).await.unwrap();
+                demo.command(Command::Address(1, "alice@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                drop(demo);
+                let mut demo = Demo::open(dir.path()).await.unwrap();
+                demo.verifier = Arc::new(CountingVerifier(calls.clone()));
+                demo.command(Command::Address(0, "alice@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                for check in &mut demo.saved.verification {
+                    if let Some(report) = &mut check.report {
+                        report.checked_at_ms = 0;
+                    }
+                }
+                demo.saved
+                    .verified_addresses
+                    .get_mut("alice@example.test")
+                    .unwrap()
+                    .checked_at_ms = 0;
+                demo.command(Command::Address(0, "alice@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                for check in &mut demo.saved.verification {
+                    if let Some(report) = &mut check.report {
+                        report.max_msat = 1000;
+                    }
+                }
+                demo.saved
+                    .verified_addresses
+                    .get_mut("alice@example.test")
+                    .unwrap()
+                    .max_msat = 1000;
+                demo.command(Command::Address(0, "alice@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+            });
+    }
+    #[test]
+    fn host_uses_full_invoice_for_admission_and_only_pot_for_payouts() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut demo = Demo::open(dir.path()).await.unwrap();
+                demo.update_unfunded_settings(400, 1, 2_000, 250)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    demo.wallet
+                        .decode_invoice(&demo.saved.invoices[0])
+                        .unwrap()
+                        .amount_sats,
+                    Some(410)
+                );
+                demo.command(Command::Addresses([
+                    "alice@example.test".into(),
+                    "bob@example.test".into(),
+                ]))
+                .await
+                .unwrap();
+                demo.command(Command::Action(2)).await.unwrap();
+                demo.command(Command::Action(3)).await.unwrap();
+                demo.reconcile().await.unwrap();
+                assert_eq!(demo.view().unwrap().paid_sats, [410, 410, 0, 0]);
+                assert_eq!(demo.view().unwrap().collected_fee_sats, 20);
+                demo.update_unfunded_settings(300, 2, 10_000, 0)
+                    .await
+                    .unwrap();
+                assert_eq!(demo.saved.pot.batch_window_ms, 2_000);
+                assert_eq!(demo.saved.pot.surcharge_bps, 250);
+                demo.command(Command::Action(4)).await.unwrap();
+                demo.command(Command::Credits(vec![Credit {
+                    sequence: 1,
+                    attacker: 0,
+                    victim: 1,
+                    damage_centi: 1000,
+                }]))
+                .await
+                .unwrap();
+                let view = demo.view().unwrap();
+                assert!((1_000..=2_000).contains(&view.batch_remaining_ms[0]));
+                demo.command(Command::Action(6)).await.unwrap();
+                demo.reconcile().await.unwrap();
+                assert_eq!(demo.saved.receipts.iter().map(|r| r.sats).sum::<u64>(), 800);
+                assert_eq!(demo.saved.pot.collected_fee_sats(), 20);
+            });
     }
     struct Handle(*mut LocalHandle);
     impl Handle {
@@ -1974,7 +2184,7 @@ mod tests {
 
     #[test]
     fn two_fresh_invoices_live_outgoing_payout_then_winner_pot_and_new_invoices() {
-        assert_eq!(std::mem::size_of::<LocalView>(), 14464);
+        assert_eq!(std::mem::size_of::<LocalView>(), 14504);
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
         let initial = host.wait(|v| v.busy == 0);

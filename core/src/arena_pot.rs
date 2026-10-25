@@ -31,6 +31,11 @@ pub struct MatchPot {
     pub id: String,
     pub entry_sats: u64,
     pub sats_per_percent: u64,
+    #[serde(default = "default_batch_window_ms")]
+    pub batch_window_ms: u64,
+    /// Extra invoice contribution retained by the host wallet for routing fees.
+    #[serde(default)]
+    pub surcharge_bps: u32,
     pub phase: Phase,
     pub paid: [bool; PLAYERS],
     pub remaining: [u64; PLAYERS],
@@ -64,6 +69,10 @@ fn default_teams() -> [u8; PLAYERS] {
     [NO_TEAM; PLAYERS]
 }
 
+fn default_batch_window_ms() -> u64 {
+    5_000
+}
+
 impl MatchPot {
     pub fn new(id: String, entry_sats: u64, sats_per_percent: u64) -> Result<Self> {
         if id.is_empty()
@@ -77,6 +86,8 @@ impl MatchPot {
             id,
             entry_sats,
             sats_per_percent,
+            batch_window_ms: default_batch_window_ms(),
+            surcharge_bps: 0,
             phase: Phase::Funding,
             paid: [false; PLAYERS],
             remaining: [0; PLAYERS],
@@ -92,6 +103,48 @@ impl MatchPot {
             last_credit_sequence: 0,
             fractional_sats: [[0; PLAYERS]; PLAYERS],
         })
+    }
+
+    pub fn surcharge_sats(&self) -> u64 {
+        (u128::from(self.entry_sats) * u128::from(self.surcharge_bps)).div_ceil(10_000) as u64
+    }
+    pub fn invoice_sats(&self) -> u64 {
+        self.entry_sats + self.surcharge_sats()
+    }
+    pub fn collected_fee_sats(&self) -> u64 {
+        self.paid.iter().filter(|&&paid| paid).count() as u64 * self.surcharge_sats()
+    }
+    pub fn set_surcharge_bps(&mut self, basis_points: u32) -> Result<()> {
+        if self.phase != Phase::Funding || self.paid.iter().any(|&paid| paid) {
+            return Err(Error::Rejected(
+                "funded match payment settings are locked".into(),
+            ));
+        }
+        let fee = (u128::from(self.entry_sats) * u128::from(basis_points)).div_ceil(10_000);
+        if basis_points > 10_000
+            || u128::from(self.entry_sats) + fee > u128::from(MAX_BALANCE_SATS / PLAYERS as u64)
+        {
+            return Err(Error::Rejected(
+                "routing surcharge or total invoice is outside supported limits".into(),
+            ));
+        }
+        self.surcharge_bps = basis_points;
+        Ok(())
+    }
+
+    pub fn set_batch_window_ms(&mut self, milliseconds: u64) -> Result<()> {
+        if !(1_000..=120_000).contains(&milliseconds) || milliseconds % 1000 != 0 {
+            return Err(Error::Rejected(
+                "damage payout delay must be 1–120 whole seconds".into(),
+            ));
+        }
+        if self.phase != Phase::Funding || self.paid.iter().any(|&paid| paid) {
+            return Err(Error::Rejected(
+                "funded match payment settings are locked".into(),
+            ));
+        }
+        self.batch_window_ms = milliseconds;
+        Ok(())
     }
 
     /// Only an unfunded lobby may change roster. Funded changes must first take
@@ -139,7 +192,7 @@ impl MatchPot {
 
     /// The wallet has confirmed this current-match invoice's exact entry amount.
     pub fn confirm_entry(&mut self, player: usize, sats: u64) -> Result<()> {
-        if player >= PLAYERS || self.kinds[player] != HUMAN || sats != self.entry_sats {
+        if player >= PLAYERS || self.kinds[player] != HUMAN || sats != self.invoice_sats() {
             return Err(Error::Rejected("incorrect entry payment".into()));
         }
         if self.paid[player] {
@@ -151,7 +204,7 @@ impl MatchPot {
             ));
         }
         self.paid[player] = true;
-        self.remaining[player] = sats;
+        self.remaining[player] = self.entry_sats;
         self.update_funding_phase();
         Ok(())
     }
@@ -235,7 +288,8 @@ impl MatchPot {
             self.remaining[victim] -= sats;
             if sats > 0 {
                 self.unbatched[attacker] += sats;
-                self.batch_deadline_ms[attacker].get_or_insert(now_ms.saturating_add(5_000));
+                self.batch_deadline_ms[attacker]
+                    .get_or_insert(now_ms.saturating_add(self.batch_window_ms));
             }
         }
         Ok(())
@@ -717,5 +771,92 @@ mod tests {
             assert_eq!(p.phase, Phase::Settled);
             conserved(&p);
         }
+    }
+    #[test]
+    fn surcharge_is_added_to_invoice_and_never_stolen_or_settled() {
+        for teams_mode in [false, true] {
+            let mut p = MatchPot::new("fees".into(), 401, 1).unwrap();
+            p.set_surcharge_bps(250).unwrap(); // fractional fee rounds up once per invoice
+            assert_eq!(p.surcharge_sats(), 11);
+            assert_eq!(p.invoice_sats(), 412);
+            p.configure(
+                teams_mode,
+                [HUMAN; 4],
+                if teams_mode {
+                    [0, 1, 0, 1]
+                } else {
+                    [NO_TEAM; 4]
+                },
+            )
+            .unwrap();
+            assert!(p.confirm_entry(0, 401).is_err());
+            for player in 0..4 {
+                p.confirm_entry(player, 412).unwrap();
+            }
+            assert_eq!(p.remaining, [401; 4]);
+            assert_eq!(p.collected_fee_sats(), 44);
+            assert!(p.set_surcharge_bps(0).is_err());
+            assert!(p.set_batch_window_ms(2_000).is_err());
+            p.start().unwrap();
+            p.finish(Some(0)).unwrap();
+            assert_eq!(p.payouts.iter().map(|p| p.sats).sum::<u64>(), 1604);
+        }
+    }
+    #[test]
+    fn configurable_window_is_fixed_from_first_hit_and_persisted() {
+        let mut p = MatchPot::new("delay".into(), 400, 1).unwrap();
+        assert!(p.set_batch_window_ms(0).is_err());
+        assert!(p.set_batch_window_ms(1500).is_err());
+        assert!(p.set_batch_window_ms(121_000).is_err());
+        p.set_batch_window_ms(2_000).unwrap();
+        for i in 0..2 {
+            p.confirm_entry(i, 400).unwrap();
+        }
+        p.start().unwrap();
+        p.credit_batch_at(
+            &[Credit {
+                sequence: 1,
+                attacker: 0,
+                victim: 1,
+                damage_centi: 1000,
+            }],
+            1_000,
+        )
+        .unwrap();
+        p.credit_batch_at(
+            &[Credit {
+                sequence: 2,
+                attacker: 0,
+                victim: 1,
+                damage_centi: 500,
+            }],
+            2_500,
+        )
+        .unwrap();
+        assert_eq!(p.batch_deadline_ms[0], Some(3_000));
+        let mut recovered: MatchPot =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        recovered.flush_due(2_999);
+        assert!(recovered.payouts.is_empty());
+        recovered.flush_due(3_000);
+        assert_eq!(recovered.payouts[0].sats, 15);
+        let mut old = serde_json::to_value(&p).unwrap();
+        old.as_object_mut().unwrap().remove("batch_window_ms");
+        old.as_object_mut().unwrap().remove("surcharge_bps");
+        let old: MatchPot = serde_json::from_value(old).unwrap();
+        assert_eq!(old.batch_window_ms, 5_000);
+        assert_eq!(old.surcharge_bps, 0);
+    }
+    #[test]
+    fn cancelled_match_returns_playable_pot_and_retains_disclosed_contribution() {
+        let mut p = MatchPot::new("cancel".into(), 400, 1).unwrap();
+        p.set_surcharge_bps(200).unwrap();
+        p.confirm_entry(0, 408).unwrap();
+        p.finish(None).unwrap();
+        assert_eq!(p.payouts.iter().map(|p| p.sats).sum::<u64>(), 400);
+        assert_eq!(p.collected_fee_sats(), 8);
+        let mut huge = MatchPot::new("limit".into(), MAX_BALANCE_SATS / 4, 1).unwrap();
+        assert!(huge.set_surcharge_bps(1).is_err());
+        assert!(p.set_surcharge_bps(10_001).is_err());
     }
 }

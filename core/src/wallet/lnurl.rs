@@ -12,7 +12,7 @@ use std::{
 };
 
 const MAX_BODY: usize = 256 * 1024;
-pub const VERIFICATION_TTL_MS: u64 = 10 * 60 * 1000;
+pub const VERIFICATION_TTL_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddressVerification {

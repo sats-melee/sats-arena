@@ -389,3 +389,44 @@ fn unknown_retired_invoice_stays_monitored_without_blocking_other_returns_or_cur
         assert_eq!(fake.payment_attempts(), 1);
     });
 }
+
+#[test]
+fn replaced_surcharge_invoice_is_returned_in_full_at_its_original_amount() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Arc::new(FakeWallet::default());
+        let mut demo = open(dir.path(), wallet.clone()).await;
+        demo.update_unfunded_settings(400, 1, 2_000, 250)
+            .await
+            .unwrap();
+        verified_room(&mut demo).await;
+        let old_hash = demo.saved.hashes[0].clone();
+        demo.update_unfunded_settings(300, 1, 10_000, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            demo.saved
+                .retired_entries
+                .iter()
+                .find(|e| e.incoming_hash == old_hash)
+                .unwrap()
+                .expected_sats,
+            410
+        );
+        wallet.set_invoice_state(&old_hash, InvoiceState::Paid { amount_sats: 410 });
+        until(&mut demo, |d| {
+            d.saved.receipts.iter().any(|r| r.id == late_id(&old_hash))
+        })
+        .await;
+        let receipt = demo
+            .saved
+            .receipts
+            .iter()
+            .find(|r| r.id == late_id(&old_hash))
+            .unwrap();
+        assert_eq!(receipt.sats, 410);
+        assert_eq!(receipt.address, "alice@example.test");
+        assert!(!demo.saved.pot.paid.iter().any(|&paid| paid));
+        assert_eq!(demo.saved.pot.collected_fee_sats(), 0);
+    });
+}
