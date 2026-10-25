@@ -15,7 +15,7 @@ typedef struct ArenaLocalView {
 } ArenaLocalView;
 /* Phase: 0 loading, 1 funding, 2 ready, 3 playing, 4 settled, 5 cancelled, 6 disputed, 7 error.
  * Actions: 1 new, 2 simulate P1 payment, 3 simulate P2 payment, 4 start,
- * 5 cancel before start, 6 P1 wins, 7 P2 wins, 8 no contest (FAKE-ONLY results).
+ * 5 cancel before start, 6 P1 wins, 7 P2 wins, 8 no contest (game-event notifications in the FAKE-ONLY host).
  * No HTTP, NWC configuration, or real payment backend exists in this host.
  */
 ArenaLocalHandle* arena_local_create(const char* folder);

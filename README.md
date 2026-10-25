@@ -29,11 +29,14 @@ and withdraws winnings by calling the engine directly. It opens no network
 listener and moves no real sats. The same crate can be linked into Dolphin
 through its existing Rust/C++ bridge on a background runtime.
 
-The native Dolphin build can now link the fake-only embedded host and show a
-funding dialog. See `Ishiiruka/docs/LocalFundingPreview.md`. It gates emulator
-launch until both 500-sat budgets are reserved. **It is not a per-game
-stage-select hook.** Results in this preview are explicit manual test inputs,
-not automatic tracker-based settlement; damage billing is off.
+The native Dolphin build links the fake-only embedded host into its sidebar.
+Melee boots immediately. At the character-select **PRESS START** prompt, the
+sidebar displays invoices and QR codes; the game transition waits for both
+500-sat budgets. A queued Start continues once both are funded. Normal game-end
+placements settle the win bonus automatically, then the next match repeats
+the funding loop without restarting emulation. Confirmed balances are reused.
+See `Ishiiruka/docs/LocalFundingPreview.md`. The host uses a fake wallet and
+test QR codes; damage billing is off.
 
 **Not wired yet:** launcher Local/Remote mode selection and the real NWC wallet
 adapter. The launcher's current Host button still starts the server preview.
