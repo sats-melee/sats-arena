@@ -4,7 +4,7 @@ The local game supports **2–4 participants in free-for-all or team battles**.
 Every human verifies a Lightning Address and pays a fresh entry each match;
 CPUs neither fund nor receive payments. See [the payment rules](docs/match-payments.md).
 
-Defaults: 500 sats per human, 10 sats per 1% attributed opponent damage.
+Defaults: 500 sats per human, 1 sat per 1% attributed opponent damage.
 Damage steals from the victim's remaining contribution and pays the attacker
 in five-second batches. At match end, winners recover their own unspent funds
 and split all losing sides' remaining pots evenly among winning humans.
@@ -41,7 +41,7 @@ listener and moves no real sats. The same crate can be linked into Dolphin
 through its existing Rust/C++ bridge on a background runtime.
 
 The native Dolphin build embeds the prepaid host in its scrollable sidebar.
-Melee boots immediately. Each active human has an address and Verify button,
+Melee boots immediately. Each active human has an address checked automatically at PRESS START,
 entry QR, funding status and pot. Start stays blocked until every human is
 verified and paid. Finalized, sequenced attacker/victim credits trigger batched
 simulated payouts; an authoritative team result drives settlement. Changing a

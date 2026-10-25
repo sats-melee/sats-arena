@@ -62,7 +62,7 @@ impl Default for LocalView {
             simulated: 1,
             revision: 0,
             entry_sats: 500,
-            sats_per_percent: 10,
+            sats_per_percent: 1,
             paid_sats: [0; 4],
             remaining_sats: [0; 4],
             earned_sats: [0; 4],
@@ -112,6 +112,10 @@ struct Saved {
     next_roster: Option<Roster>,
     #[serde(default)]
     events: Vec<String>,
+    #[serde(default)]
+    activity: Vec<Activity>,
+    #[serde(default)]
+    log_version: u32,
     pot: MatchPot,
     invoices: [String; 4],
     hashes: [String; 4],
@@ -129,6 +133,21 @@ struct Saved {
     simulated: bool,
     #[serde(default)]
     verification: [AddressCheck; 4],
+}
+#[derive(Serialize, Deserialize, Clone)]
+struct Activity {
+    at_ms: u64,
+    message: String,
+}
+fn receipt_message(receipt: &Receipt, simulated: bool) -> String {
+    format!(
+        "{}Player {} received {} sats • {} → {}",
+        if simulated { "SIMULATED " } else { "" },
+        receipt.player + 1,
+        receipt.sats,
+        receipt.detail.to_lowercase(),
+        receipt.address
+    )
 }
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct AddressCheck {
@@ -165,7 +184,7 @@ impl Demo {
         let pot = MatchPot::new(
             format!("match-{:032x}", rand::random::<u128>()),
             setting("SATS_ARENA_ENTRY_SATS", 500)?,
-            setting("SATS_ARENA_SATS_PER_PERCENT", 10)?,
+            setting("SATS_ARENA_SATS_PER_PERCENT", 1)?,
         )?;
         let mut invoices = std::array::from_fn(|_| String::new());
         let mut hashes = std::array::from_fn(|_| String::new());
@@ -181,6 +200,8 @@ impl Demo {
             roster: None,
             next_roster: None,
             events: vec![],
+            activity: vec![],
+            log_version: 1,
             pot,
             invoices,
             hashes,
@@ -309,6 +330,29 @@ impl Demo {
         saved
             .used_payment_hashes
             .extend(saved.prepared.values().map(|p| p.payment_hash.clone()));
+        if saved.log_version == 0 {
+            // Old invoice/result strings have no timestamps. Retain them in the
+            // archive, but do not invent their position in the new timeline.
+            saved.activity = saved
+                .receipts
+                .iter()
+                .map(|r| Activity {
+                    at_ms: r.at_ms,
+                    message: receipt_message(r, saved.simulated),
+                })
+                .collect();
+            saved.activity.sort_by_key(|entry| entry.at_ms);
+            saved.log_version = 1;
+        }
+        if saved.pot.phase == Phase::Funding && !saved.pot.paid.iter().any(|p| *p) {
+            let rate = std::env::var("SATS_ARENA_SATS_PER_PERCENT").unwrap_or_else(|_| "1".into());
+            let rate = rate
+                .parse::<u64>()
+                .map_err(|_| Error::Rejected("invalid SATS_ARENA_SATS_PER_PERCENT".into()))?;
+            // Validate bounds without changing any already-funded match agreement.
+            MatchPot::new("settings".into(), saved.pot.entry_sats, rate)?;
+            saved.pot.sats_per_percent = rate;
+        }
         saved.schema = 3;
         let demo = Self {
             wallet,
@@ -348,7 +392,14 @@ impl Demo {
         }
         Ok(())
     }
+    fn record_activity(&mut self, at_ms: u64, message: String) {
+        self.saved.activity.push(Activity { at_ms, message });
+        if self.saved.activity.len() > 100 {
+            self.saved.activity.remove(0);
+        }
+    }
     fn event(&mut self, message: String) {
+        self.record_activity(now_ms(), message.clone());
         self.saved.events.push(message);
         if self.saved.events.len() > 30 {
             self.saved.events.remove(0);
@@ -378,6 +429,7 @@ impl Demo {
         next.verification = self.saved.verification.clone();
         next.receipts = self.saved.receipts.clone();
         next.events = self.saved.events.clone();
+        next.activity = self.saved.activity.clone();
         next.max_fee_sats = self.saved.max_fee_sats;
         next.used_payment_hashes = self.saved.used_payment_hashes.clone();
         self.saved = next;
@@ -622,7 +674,7 @@ impl Demo {
                         // Account for money already received even if a receiver check expired.
                         self.saved.pot.confirm_entry(player, amount_sats)?;
                         self.event(format!(
-                            "Entry P{} • {} sats received",
+                            "Player {} Invoice Paid — {} sats",
                             player + 1,
                             amount_sats
                         ));
@@ -723,6 +775,9 @@ impl Demo {
                         sats: payout.sats,
                         detail: format!("{:?}", payout.reason),
                     });
+                    let message =
+                        receipt_message(self.saved.receipts.last().unwrap(), self.saved.simulated);
+                    self.record_activity(at_ms, message);
                     if self.saved.receipts.len() > 100 {
                         self.saved.receipts.remove(0);
                     }
@@ -807,27 +862,15 @@ impl Demo {
                 .unwrap_or(0);
         }
         let mut log = String::new();
-        for receipt in self.saved.receipts.iter().rev().take(12).rev() {
-            let seconds = receipt.at_ms / 1000;
+        for entry in self.saved.activity.iter().rev().take(18).rev() {
+            let seconds = entry.at_ms / 1000;
             log.push_str(&format!(
-                "{:02}:{:02}:{:02}Z {}PAID {} sats -> P{} {} ({})\n",
+                "{:02}:{:02}:{:02}Z {}\n",
                 (seconds / 3600) % 24,
                 (seconds / 60) % 60,
                 seconds % 60,
-                if self.simulation.is_some() {
-                    "SIMULATED "
-                } else {
-                    ""
-                },
-                receipt.sats,
-                receipt.player + 1,
-                receipt.address,
-                receipt.detail
+                entry.message
             ));
-        }
-        for event in self.saved.events.iter().rev().take(6).rev() {
-            log.push_str(event);
-            log.push('\n');
         }
         text(&mut view.payment_log, &log);
         Ok(view)
@@ -1323,17 +1366,17 @@ mod tests {
         host.fund();
         let live = host.credit([0, 800]);
         assert_eq!(live.earned_sats, [0, 0, 0, 0]);
-        assert_eq!(live.pending_sats, [80, 0, 0, 0]);
+        assert_eq!(live.pending_sats, [8, 0, 0, 0]);
         assert!(live.batch_remaining_ms[0] > 4_000);
-        let paid = host.wait(|v| v.earned_sats == [80, 0, 0, 0]);
+        let paid = host.wait(|v| v.earned_sats == [8, 0, 0, 0]);
         assert!(String::from_utf8_lossy(&paid.payment_log).contains("alice@example.test"));
-        assert_eq!(live.remaining_sats, [500, 420, 0, 0]);
+        assert_eq!(live.remaining_sats, [500, 492, 0, 0]);
         assert_eq!(live.phase, 3);
-        assert_eq!(host.credit([0, 800]).earned_sats, [80, 0, 0, 0]);
-        let end = host.action(7); // P2 wins: all 920 remaining sats go to P2.
-        assert_eq!(end.earned_sats, [80, 920, 0, 0]);
+        assert_eq!(host.credit([0, 800]).earned_sats, [8, 0, 0, 0]);
+        let end = host.action(7); // P2 wins: all 992 remaining sats go to P2.
+        assert_eq!(end.earned_sats, [8, 992, 0, 0]);
         assert_eq!(end.phase, 4);
-        assert_eq!(host.action(7).earned_sats, [80, 920, 0, 0]); // Duplicate end is harmless.
+        assert_eq!(host.action(7).earned_sats, [8, 992, 0, 0]); // Duplicate end is harmless.
         let next = host.action(1);
         assert_eq!(next.phase, 1);
         assert_eq!(next.paid_sats, [0, 0, 0, 0]);
@@ -1352,8 +1395,8 @@ mod tests {
         host.credit([0, 800]);
         drop(host);
         let host = Handle::open(dir.path());
-        assert_eq!(host.credit([0, 800]).pending_sats, [80, 0, 0, 0]);
-        assert_eq!(host.action(8).earned_sats, [580, 420, 0, 0]); // Return unspent contributions.
+        assert_eq!(host.credit([0, 800]).pending_sats, [8, 0, 0, 0]);
+        assert_eq!(host.action(8).earned_sats, [508, 492, 0, 0]); // Return unspent contributions.
         drop(host);
         let host = Handle::open(dir.path());
         assert_eq!(host.action(1).paid_sats, [0, 0, 0, 0]);
@@ -1397,12 +1440,12 @@ mod tests {
             let mut recovered = Demo::open(dir.path()).await.unwrap();
             recovered.reconcile().await.unwrap();
             assert_eq!(recovered.simulation.as_ref().unwrap().payment_attempts(), 0);
-            assert_eq!(recovered.view().unwrap().pending_sats, [80, 0, 0, 0]);
+            assert_eq!(recovered.view().unwrap().pending_sats, [8, 0, 0, 0]);
             assert_eq!(recovered.view().unwrap().earned_sats, [0, 0, 0, 0]);
             recovered.command(Command::Action(7)).await.unwrap();
             recovered.reconcile().await.unwrap();
             assert_eq!(recovered.saved.pot.phase, Phase::Settling);
-            assert_eq!(recovered.saved.pot.earned, [0, 920, 0, 0]);
+            assert_eq!(recovered.saved.pot.earned, [0, 992, 0, 0]);
             assert_eq!(recovered.simulation.as_ref().unwrap().payment_attempts(), 1); // Only the new winner payout.
             assert!(recovered.command(Command::Action(1)).await.is_err());
         });

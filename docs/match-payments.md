@@ -14,7 +14,7 @@ before a new roster receives fresh invoices. The four player cards scroll.
 
 Finalized game credits carry attacker, victim, damage and an ordered sequence.
 Opponent damage steals from the victim's remaining contribution at the configured
-rate (default 10 sats per 1%). Self/environmental damage, friendly fire, CPU attacks
+rate (default 1 sat per 1%). Self/environmental damage, friendly fire, CPU attacks
 and hits against CPUs transfer nothing. CPU/friendly observations still advance
 the sequence. Fractional sats accumulate per attacker/victim pair; victim funds
 cannot go negative. Ordered processing preserves which attacker exhausted a pot.

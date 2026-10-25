@@ -1,8 +1,10 @@
 # Receiving-address verification
 
-Each address has its own **Verify** button that performs a live receiving
-check independently of the funding wallet and the other player's address. All participating humans need a current,
-compatible result before entry QR codes are displayed or funding is accepted.
+Each participating human's receiving address is checked automatically at the
+character-select PRESS START gate, after a short typing debounce. A fresh check
+runs for each match; there is no required Verify click. A failed check shows the
+player's error and an optional Retry button. Editing the address retries
+normally. All humans must pass before funding or Start.
 
 For each address, the background worker:
 
@@ -27,7 +29,7 @@ verified. Editing one address invalidates only its displayed verification.
 - **Checking receiver…**: background network checks are running.
 - **Verified**: valid receiving endpoint and test invoice; advertised range shown.
 - **Failed**: provider/network/protocol error shown beside that player.
-- **Expired**: more than ten minutes since verification; verify again.
+- **Expired**: more than ten minutes since verification; refreshed automatically.
 - **Incompatible**: receiving limits cannot cover one-sat batches through the
   complete current match pot (human contributions only). Funding stays disabled.
 
@@ -42,7 +44,8 @@ callbacks such as Alby. DNS answers are checked for public addresses and pinned
 for each request. HTTP downgrades, private/local targets, URL credentials,
 unexpected ports, oversized responses and mandatory unsupported payer fields
 are rejected. Requests have bounded timeouts; the GUI and emulation remain
-responsive. No endpoint is checked automatically while typing.
+responsive. Checks wait until typing pauses and PRESS START is ready. Failed checks do not
+repeat on every GUI tick.
 
 ## Live checks requested by the user
 
@@ -83,3 +86,13 @@ Protocol references:
 [LUD-16](https://github.com/lnurl/luds/blob/luds/16.md),
 [LUD-06](https://github.com/lnurl/luds/blob/luds/06.md),
 [BOLT11 parser](https://docs.rs/lightning-invoice/0.34.1/lightning_invoice/struct.Bolt11Invoice.html).
+
+
+## Payment activity timeline
+
+Invoice confirmations, damage receipts and results share one timestamped,
+oldest-to-newest timeline, with the latest entries at the bottom. Entries read
+`Player 1 Invoice Paid — 500 sats`. Payouts identify the receiving player,
+address, amount and reason. Historical payout timestamps are migrated; older
+invoice/result strings without timestamps remain in the saved archive rather
+than being assigned an invented time in the new display.

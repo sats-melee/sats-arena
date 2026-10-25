@@ -150,25 +150,27 @@ fn four_player_ffa_sequences_pay_exact_recipients_and_log_winner() {
             .await
             .unwrap();
         demo.command(Command::Credits(credits)).await.unwrap();
-        assert_eq!(demo.view().unwrap().pending_sats, [80, 0, 0, 120]);
-        assert_eq!(demo.view().unwrap().remaining_sats, [500, 380, 420, 500]);
+        assert_eq!(demo.view().unwrap().pending_sats, [8, 0, 0, 12]);
+        assert_eq!(demo.view().unwrap().remaining_sats, [500, 488, 492, 500]);
         for deadline in &mut demo.saved.pot.batch_deadline_ms {
             if deadline.is_some() {
                 *deadline = Some(0);
             }
         }
         demo.reconcile().await.unwrap();
-        assert_eq!(demo.view().unwrap().earned_sats, [80, 0, 0, 120]);
+        assert_eq!(demo.view().unwrap().earned_sats, [8, 0, 0, 12]);
         assert_eq!(demo.saved.pot.phase, Phase::Playing);
         assert_eq!(demo.saved.receipts.len(), 2);
-        assert!(log(&demo).contains("PAID 80 sats -> P1 player1@example.test"));
-        assert!(log(&demo).contains("PAID 120 sats -> P4 player4@example.test"));
+        assert!(log(&demo).contains("Player 1 received 8 sats • damage → player1@example.test"));
+        assert!(log(&demo).contains("Player 4 received 12 sats • damage → player4@example.test"));
         demo.command(Command::Action(11)).await.unwrap(); // P3
         demo.reconcile().await.unwrap();
-        assert_eq!(demo.view().unwrap().earned_sats, [80, 0, 1800, 120]);
+        assert_eq!(demo.view().unwrap().earned_sats, [8, 0, 1980, 12]);
         assert_eq!(demo.saved.pot.phase, Phase::Settled);
         assert!(log(&demo).contains("Player 3 wins"));
-        assert!(log(&demo).contains("PAID 1800 sats -> P3 player3@example.test"));
+        assert!(
+            log(&demo).contains("Player 3 received 1980 sats • settlement → player3@example.test")
+        );
         conserved(&demo);
     });
 }
@@ -214,8 +216,8 @@ fn team_match_excludes_cpu_and_friendly_fire_and_logs_the_winning_team() {
         ]))
         .await
         .unwrap();
-        assert_eq!(demo.saved.pot.remaining, [500, 420, 500, 0]);
-        assert_eq!(demo.saved.pot.pending(), [80, 0, 0, 0]);
+        assert_eq!(demo.saved.pot.remaining, [500, 492, 500, 0]);
+        assert_eq!(demo.saved.pot.pending(), [8, 0, 0, 0]);
         demo.command(Command::Action(12)).await.unwrap(); // CPU represents winning Blue side.
         demo.command(Command::Action(7)).await.unwrap(); // Same Blue result from a human representative.
         demo.reconcile().await.unwrap();
@@ -227,7 +229,7 @@ fn team_match_excludes_cpu_and_friendly_fire_and_logs_the_winning_team() {
                 .count(),
             1
         );
-        assert_eq!(demo.view().unwrap().earned_sats, [80, 1420, 0, 0]);
+        assert_eq!(demo.view().unwrap().earned_sats, [8, 1492, 0, 0]);
         assert!(log(&demo).contains("Blue Team wins"));
         assert!(demo.saved.receipts.iter().all(|r| r.player != 3));
         conserved(&demo);
@@ -353,10 +355,10 @@ fn restart_and_no_contest_keep_credited_earnings_without_replaying_transfers() {
         let mut demo = Demo::open(dir.path()).await.unwrap();
         demo.command(Command::Credits(credits)).await.unwrap();
         assert_eq!(demo.view().unwrap().last_credit_sequence, 1);
-        assert_eq!(demo.saved.pot.pending(), [0, 0, 0, 100]);
+        assert_eq!(demo.saved.pot.pending(), [0, 0, 0, 10]);
         demo.command(Command::Action(8)).await.unwrap();
         demo.reconcile().await.unwrap();
-        assert_eq!(demo.view().unwrap().earned_sats, [400, 500, 500, 600]);
+        assert_eq!(demo.view().unwrap().earned_sats, [490, 500, 500, 510]);
         let receipts = demo.saved.receipts.len();
         demo.command(Command::Action(8)).await.unwrap();
         demo.reconcile().await.unwrap();
@@ -485,5 +487,69 @@ fn schema_two_migration_preserves_two_player_funds_payout_ids_and_fractional_dam
         );
         assert_eq!(migrated.saved.pot.phase, Phase::Settled);
         conserved(&migrated);
+    });
+}
+
+#[test]
+fn activity_is_a_single_persistent_timeline_with_clear_invoice_labels() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut demo = Demo::open(dir.path()).await.unwrap();
+        verify_humans(&mut demo).await;
+        fund_humans(&mut demo).await;
+        demo.command(Command::Action(4)).await.unwrap();
+        demo.command(Command::Credits(vec![Credit {
+            sequence: 1,
+            attacker: 0,
+            victim: 1,
+            damage_centi: 800,
+        }]))
+        .await
+        .unwrap();
+        demo.saved.pot.batch_deadline_ms[0] = Some(0);
+        demo.reconcile().await.unwrap();
+        demo.command(Command::Action(7)).await.unwrap();
+        demo.reconcile().await.unwrap();
+        demo.command(Command::Action(1)).await.unwrap();
+        fund_humans(&mut demo).await;
+        let lines = log(&demo);
+        let first_invoice = lines.find("Player 1 Invoice Paid — 500 sats").unwrap();
+        let damage = lines.find("Player 1 received 8 sats • damage").unwrap();
+        let winner = lines.find("Player 2 wins").unwrap();
+        let settlement = lines
+            .find("Player 2 received 992 sats • settlement")
+            .unwrap();
+        let next_invoice = lines.rfind("Player 1 Invoice Paid — 500 sats").unwrap();
+        assert!(
+            first_invoice < damage
+                && damage < winner
+                && winner < settlement
+                && settlement < next_invoice
+        );
+        assert!(lines.lines().all(|line| line.as_bytes()[8] == b'Z'));
+        assert!(!lines.contains("Entry P"));
+        drop(demo);
+        let recovered = Demo::open(dir.path()).await.unwrap();
+        assert_eq!(log(&recovered), lines);
+    });
+}
+
+#[test]
+fn one_sat_default_updates_unfunded_lobbies_but_preserves_paid_agreements() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut demo = Demo::open(dir.path()).await.unwrap();
+        assert_eq!(demo.saved.pot.sats_per_percent, 1);
+        demo.saved.pot.sats_per_percent = 10;
+        demo.save().unwrap();
+        drop(demo);
+        let mut demo = Demo::open(dir.path()).await.unwrap();
+        assert_eq!(demo.saved.pot.sats_per_percent, 1);
+        demo.saved.pot.sats_per_percent = 10;
+        demo.saved.pot.confirm_entry(0, 500).unwrap();
+        demo.save().unwrap();
+        drop(demo);
+        let demo = Demo::open(dir.path()).await.unwrap();
+        assert_eq!(demo.saved.pot.sats_per_percent, 10);
     });
 }
