@@ -34,6 +34,8 @@ bool arena_local_snapshot(const ArenaLocalHandle*, ArenaLocalView* out);
 bool arena_local_action(const ArenaLocalHandle*, uint32_t action);
 bool arena_local_credit(const ArenaLocalHandle*, uint64_t p1_damage_centi, uint64_t p2_damage_centi);
 bool arena_local_addresses(const ArenaLocalHandle*, const char* p1, const char* p2);
+/* Verify only this player (0/1), preserving the other receiving address/check. */
+bool arena_local_verify_address(const ArenaLocalHandle*, uint32_t player, const char* address);
 void arena_local_destroy(ArenaLocalHandle*);
 #ifdef __cplusplus
 }

@@ -1,7 +1,7 @@
 # Receiving-address verification
 
-The side panel's **Verify receiving addresses** button performs live receiving
-checks independently of the funding wallet. Both players need a current,
+Each address has its own **Verify** button that performs a live receiving
+check independently of the funding wallet and the other player's address. Both players need a current,
 compatible result before entry QR codes are displayed or funding is accepted.
 
 For each address, the background worker:
@@ -17,6 +17,9 @@ For each address, the background worker:
 No payment is sent. Verification does not establish ownership of the address,
 prove successful routing, or guarantee that a later payment will succeed.
 Each eventual payout requests and validates a fresh invoice.
+
+A red message at the top blocks match start until both current addresses are
+verified. Editing one address invalidates only its displayed verification.
 
 ## Sidebar states
 

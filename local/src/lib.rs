@@ -78,6 +78,7 @@ enum Command {
     Action(u32),
     Credit([u64; 2]),
     Addresses([String; 2]),
+    Address(usize, String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -274,6 +275,42 @@ impl Demo {
     async fn command(&mut self, command: Command) -> Result<()> {
         match command {
             Command::Credit(totals) => self.saved.pot.credit_at(totals, now_ms())?,
+            Command::Address(player, value) => {
+                if player > 1 {
+                    return Err(Error::Rejected("invalid player".into()));
+                }
+                let address = parse_address(&value)?;
+                if !matches!(self.saved.pot.phase, Phase::Funding | Phase::Ready)
+                    || (self.saved.pot.paid.iter().any(|paid| *paid)
+                        && address.as_str() != self.saved.addresses[player])
+                {
+                    return Err(Error::Rejected(
+                        "payout addresses are locked after entry payment".into(),
+                    ));
+                }
+                self.saved.addresses[player] = address.as_str().into();
+                self.saved.verification[player] = AddressCheck::default();
+                self.save()?;
+                self.saved.verification[player] = match tokio::time::timeout(
+                    Duration::from_secs(20),
+                    self.verifier.verify(&address),
+                )
+                .await
+                {
+                    Ok(Ok(report)) => AddressCheck {
+                        report: Some(report),
+                        error: String::new(),
+                    },
+                    Ok(Err(error)) => AddressCheck {
+                        report: None,
+                        error: format!("{error:#}"),
+                    },
+                    Err(_) => AddressCheck {
+                        report: None,
+                        error: "Address verification timed out; try again".into(),
+                    },
+                };
+            }
             Command::Addresses(addresses) => {
                 let first = parse_address(&addresses[0])?;
                 let second = parse_address(&addresses[1])?;
@@ -858,6 +895,41 @@ pub unsafe extern "C" fn arena_local_credit(
 }
 
 /// # Safety
+/// Address is a valid NUL-terminated UTF-8 string. Handle is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_local_verify_address(
+    handle: *const LocalHandle,
+    player: u32,
+    address: *const c_char,
+) -> bool {
+    ffi_guard(|| {
+        if handle.is_null() || address.is_null() || player > 1 {
+            return false;
+        }
+        let Ok(address) = (unsafe { CStr::from_ptr(address) }).to_str() else {
+            return false;
+        };
+        let handle = unsafe { &*handle };
+        let Ok(mut view) = handle.shared.try_lock() else {
+            return false;
+        };
+        if view.busy != 0 {
+            return false;
+        }
+        if handle
+            .sender
+            .try_send(Command::Address(player as usize, address.into()))
+            .is_err()
+        {
+            return false;
+        }
+        view.busy = 1;
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// # Safety
 /// Both address pointers are valid NUL-terminated UTF-8 strings. Handle is live.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_local_addresses(
@@ -1097,6 +1169,37 @@ mod tests {
         assert_eq!(saved.receipts.len(), 1);
         assert_eq!(saved.receipts[0].address, "alice@example.test");
         assert_eq!(saved.receipts[0].sats, 1000);
+    }
+
+    #[test]
+    fn individual_checks_preserve_other_player_and_gate_start() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut demo = Demo::open(dir.path()).await.unwrap();
+                demo.command(Command::Address(0, "alice@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(demo.view().unwrap().verification_state, [2, 0]);
+                assert!(demo.command(Command::Action(4)).await.is_err());
+                demo.command(Command::Address(1, "missing@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(demo.view().unwrap().verification_state, [2, 3]);
+                assert!(demo.command(Command::Action(4)).await.is_err());
+                demo.command(Command::Address(1, "bob@example.test".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(demo.view().unwrap().verification_state, [2, 2]);
+                assert_eq!(demo.saved.addresses[0], "alice@example.test");
+                demo.command(Command::Action(2)).await.unwrap();
+                demo.command(Command::Action(3)).await.unwrap();
+                demo.reconcile().await.unwrap();
+                demo.command(Command::Action(4)).await.unwrap();
+            });
     }
 
     #[test]
