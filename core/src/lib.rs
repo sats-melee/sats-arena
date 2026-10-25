@@ -1,5 +1,9 @@
 //! One payment engine, two hosts: embedded in Dolphin or wrapped by an HTTP server.
 //!
+//! The local match sidebar uses `pot::MatchPot`: fresh entries, live outgoing
+//! payouts and the leftover pot to the winner. No reusable player balances.
+//!
+//! The older `Engine` balance API below remains for the remote prototype.
 //! Deposits use ordinary invoices, never hold invoices. A wallet-confirmed payment
 //! credits a durable player balance exactly once. Matches only move ledger funds;
 //! withdrawals are separate Lightning payments. See `examples/local.rs`.
@@ -10,6 +14,7 @@
 mod engine;
 mod ledger;
 mod lobby;
+pub mod pot;
 mod rules;
 mod settle;
 pub mod wallet;

@@ -1,17 +1,23 @@
 # Sats Arena payment engine
 
-A shared Rust engine for local games and a self-hostable remote server.
-Gameplay stays in Dolphin; the engine keeps player balances, settles agreed
-game reports, and talks to a Lightning wallet.
+The local game uses **two fresh invoice payments per match**, live hit payouts,
+and the remaining pot going to the winner. See [the payment rules](docs/match-payments.md).
 
-**The wallet operator holds the players' sats in both modes.** Back up the
-database and keep it paired with its wallet. Ordinary deposits are accepted
-payments, not hold invoices: closing a game does not automatically refund them.
+Defaults: 500 sats from each player, 10 sats per 1% credited damage. An 8% hit
+pays 80 sats during play, leaving 920 of the 1,000-sat pot for the winner.
+There are no reusable player balances, budget reservations or fixed win bonus
+in this flow. The next match always requires two new payments.
+
+**The embedded host currently simulates both incoming and outgoing payments.**
+It has no real-wallet adapter or real player payout destinations.
+
+The older account/balance engine and HTTP server remain available as a separate
+prototype; their APIs below do not define the new match-sidebar UX.
 
 ## Layout
 
 - `protocol/`: wire types shared with the Dolphin client.
-- `core/`: the engine, SQLite ledger, settlement, and wallet interface. No HTTP
+- `core/`: the prepaid `pot::MatchPot` rules, plus the older engine, SQLite ledger, settlement, and wallet interface. No HTTP
   listener, Electron, or dependency on a specific node installation.
 - `server/`: a thin HTTP wrapper and host configuration for that same engine.
 - `local/`: fake-only C ABI host for Dolphin, with its own background worker.
@@ -24,24 +30,22 @@ payments, not hold invoices: closing a game does not automatically refund them.
 cargo run -p sats-arena-core --example local
 ```
 
-This fake-wallet demo deposits funds for two players, settles a local game,
+This CLI example exercises the older balance prototype. It deposits funds for two players, settles a local game,
 and withdraws winnings by calling the engine directly. It opens no network
 listener and moves no real sats. The same crate can be linked into Dolphin
 through its existing Rust/C++ bridge on a background runtime.
 
-The native Dolphin build links the fake-only embedded host into its sidebar.
-Melee boots immediately. At the character-select **PRESS START** prompt, the
-sidebar displays invoices and QR codes; the game transition waits for both
-500-sat budgets. A queued Start continues once both are funded. Normal game-end
-placements settle the win bonus automatically, then the next match repeats
-the funding loop without restarting emulation. Confirmed balances are reused.
-See `Ishiiruka/docs/LocalFundingPreview.md`. The host uses a fake wallet and
-test QR codes; damage billing is off.
+The native Dolphin build embeds the fake-only prepaid host in its sidebar.
+Melee boots immediately. Two QR codes appear at **PRESS START** and stay visible
+with a Paid label after confirmation. Finalized game credits trigger outgoing
+simulated payouts during play. The normal winner gets the remaining pot;
+then the next match creates two fresh entry invoices. See
+`Ishiiruka/docs/LocalFundingPreview.md`.
 
 **Not wired yet:** launcher Local/Remote mode selection and the real NWC wallet
 adapter. The launcher's current Host button still starts the server preview.
 
-## Remote mode
+## Older remote balance prototype
 
 ```sh
 cp sats-arena.example.toml sats-arena.toml   # set invite_code
@@ -53,7 +57,7 @@ engine's default test wallet instead starts invoices unpaid, so confirmation
 and expiry can be tested. NWC support is next; its config is accepted, but the
 server refuses to start that backend rather than pretending to make payments.
 
-## Payment flow
+## Older balance-engine payment flow
 
 1. Create a normal invoice for a player's deposit. Their balance stays unchanged.
 2. Look it up with the wallet. Only a confirmed paid invoice with the matching

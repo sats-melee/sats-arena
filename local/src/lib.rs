@@ -1,13 +1,9 @@
-//! Fake-only local host. This has no network listener and cannot use an NWC key.
-//! C++ only queues actions and polls a fixed-layout snapshot; all SQLite/payment
-//! work runs on an owned background thread. See include/sats_arena_local.h.
+//! Fake-only prepaid match host. Two fresh invoices per match; outgoing
+//! micropayments during play, remaining pot to the winner. No reusable balances.
 use sats_arena_core::{
-    Engine, Error, Result, Rules,
-    protocol::{
-        Deposit, DepositStatus, Lobby, LobbyPhase, LobbyRequest, MatchMode, MatchReport,
-        PROTOCOL_VERSION, PlayerSlot, RegisterResponse,
-    },
-    wallet::{FakeWallet, InvoiceState, Wallet},
+    Error, Result,
+    pot::{MatchPot, PayoutState, Phase},
+    wallet::{FakeWallet, InvoiceState, PaymentState, Wallet},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,83 +25,110 @@ pub struct LocalView {
     pub busy: u32,
     pub padding: u32,
     pub revision: u64,
-    pub budget_sats: u64,
-    pub available_sats: [u64; 2],
-    pub reserved_sats: [u64; 2],
+    pub entry_sats: u64,
+    pub sats_per_percent: u64,
+    pub paid_sats: [u64; 2],
+    pub remaining_sats: [u64; 2],
+    pub earned_sats: [u64; 2],
+    pub pending_sats: [u64; 2],
     pub invoices: [[u8; 128]; 2],
     pub error: [u8; 256],
 }
-
 impl Default for LocalView {
     fn default() -> Self {
         Self {
-            abi_version: 1,
+            abi_version: 2,
             phase: 0,
             busy: 1,
             padding: 0,
             revision: 0,
-            budget_sats: 500,
-            available_sats: [0; 2],
-            reserved_sats: [0; 2],
+            entry_sats: 500,
+            sats_per_percent: 10,
+            paid_sats: [0; 2],
+            remaining_sats: [0; 2],
+            earned_sats: [0; 2],
+            pending_sats: [0; 2],
             invoices: [[0; 128]; 2],
             error: [0; 256],
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Saved {
-    players: [RegisterResponse; 2],
-    lobby_id: String,
-    deposits: [Option<Deposit>; 2],
+enum Command {
+    Action(u32),
+    Credit([u64; 2]),
 }
 
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    schema: u32,
+    pot: MatchPot,
+    invoices: [String; 2],
+    hashes: [String; 2],
+}
 struct Demo {
-    engine: Engine,
     wallet: Arc<FakeWallet>,
     saved: Saved,
     path: PathBuf,
 }
-
 impl Demo {
-    async fn open(folder: &Path) -> Result<Self> {
-        std::fs::create_dir_all(folder).map_err(|e| Error::Internal(e.into()))?;
-        let wallet = Arc::new(FakeWallet::default()); // Never auto-pay; the UI simulates each payment explicitly.
-        let engine = Engine::open(
-            &folder.join("fake.db"),
-            Rules {
-                sats_per_percent: 0,
-                ..Rules::default()
-            },
-            wallet.clone(),
-        )?;
-        let path = folder.join("fake-players.json");
-        let saved = if path.exists() {
-            serde_json::from_slice(&std::fs::read(&path).map_err(|e| Error::Internal(e.into()))?)?
-        } else {
-            Saved {
-                players: [
-                    engine.register("Player 1").await?,
-                    engine.register("Player 2").await?,
-                ],
-                lobby_id: new_id(),
-                deposits: [None, None],
+    async fn fresh(wallet: &FakeWallet) -> Result<Saved> {
+        let setting = |name: &str, default: u64| -> Result<u64> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|_| Error::Rejected(format!("invalid {name}"))),
+                Err(_) => Ok(default),
             }
         };
-        let mut demo = Self {
-            engine,
+        let pot = MatchPot::new(
+            format!("match-{:032x}", rand::random::<u128>()),
+            setting("SATS_ARENA_ENTRY_SATS", 500)?,
+            setting("SATS_ARENA_SATS_PER_PERCENT", 10)?,
+        )?;
+        let mut invoices = [String::new(), String::new()];
+        let mut hashes = [String::new(), String::new()];
+        for i in 0..2 {
+            let invoice = wallet
+                .create_invoice(pot.entry_sats, &format!("{} P{}", pot.id, i + 1), 600)
+                .await?;
+            invoices[i] = invoice.bolt11;
+            hashes[i] = invoice.payment_hash;
+        }
+        Ok(Saved {
+            schema: 1,
+            pot,
+            invoices,
+            hashes,
+        })
+    }
+    async fn open(folder: &Path) -> Result<Self> {
+        std::fs::create_dir_all(folder).map_err(|e| Error::Internal(e.into()))?;
+        let wallet = Arc::new(FakeWallet::default());
+        // Deliberately separate from the obsolete balance/reservation preview.
+        let path = folder.join("prepaid-match.json");
+        let saved: Saved = if path.exists() {
+            serde_json::from_slice(&std::fs::read(&path).map_err(|e| Error::Internal(e.into()))?)?
+        } else {
+            Self::fresh(&wallet).await?
+        };
+        if saved.schema != 1 {
+            return Err(Error::Rejected("unsupported prepaid match state".into()));
+        }
+        let demo = Self {
             wallet,
             saved,
             path,
         };
         demo.save()?;
-        demo.prepare().await?;
         Ok(demo)
     }
-
     fn save(&self) -> Result<()> {
+        self.persist(&self.path)
+    }
+    fn persist(&self, path: &Path) -> Result<()> {
         use std::io::Write;
-        let temporary = self.path.with_extension("tmp");
+        let temporary = path.with_extension("tmp");
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -119,190 +142,154 @@ impl Demo {
         file.write_all(&serde_json::to_vec(&self.saved)?)
             .map_err(|e| Error::Internal(e.into()))?;
         file.sync_all().map_err(|e| Error::Internal(e.into()))?;
-        std::fs::rename(temporary, &self.path).map_err(|e| Error::Internal(e.into()))?;
-        Ok(())
-    }
-
-    fn roster(&self) -> Vec<PlayerSlot> {
-        self.saved
-            .players
-            .iter()
-            .enumerate()
-            .map(|(port, player)| PlayerSlot {
-                port: port as u8,
-                player_id: player.player_id.clone(),
-            })
-            .collect()
-    }
-
-    async fn lobby(&self) -> Result<Lobby> {
-        self.engine
-            .lobby(&self.saved.players[0].token, &self.saved.lobby_id)
-            .await
-    }
-
-    async fn prepare(&mut self) -> Result<()> {
-        let lobby = self
-            .engine
-            .create_lobby(
-                &self.saved.players[0].token,
-                LobbyRequest {
-                    id: self.saved.lobby_id.clone(),
-                    mode: MatchMode::Local,
-                    players: self.roster(),
-                    budget_sats: 500,
-                },
-            )
-            .await?;
-        if !matches!(lobby.phase, LobbyPhase::Funding | LobbyPhase::Ready) {
-            return Ok(());
-        }
-        for i in 0..2 {
-            let slot = &lobby.players[i];
-            if slot.reserved_sats > 0 {
-                continue;
-            }
-            if slot.available_sats >= lobby.budget_sats {
-                self.engine
-                    .ready_lobby(&self.saved.players[i].token, &self.saved.lobby_id)
-                    .await?;
-            } else if self.saved.deposits[i].is_none() {
-                let invoice = self
-                    .engine
-                    .create_deposit(
-                        &self.saved.players[i].token,
-                        lobby.budget_sats - slot.available_sats,
-                    )
-                    .await?;
-                self.saved.deposits[i] = Some(invoice);
-                self.save()?;
-            }
+        std::fs::rename(temporary, path).map_err(|e| Error::Internal(e.into()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| Error::Internal(e.into()))?;
         }
         Ok(())
     }
-
-    async fn action(&mut self, action: u32) -> Result<()> {
-        match action {
-            1 => {
-                if !matches!(
-                    self.lobby().await?.phase,
-                    LobbyPhase::Settled | LobbyPhase::Cancelled
-                ) {
-                    return Err(Error::Rejected("finish or cancel this lobby first".into()));
+    async fn command(&mut self, command: Command) -> Result<()> {
+        match command {
+            Command::Credit(totals) => self.saved.pot.credit(totals)?,
+            Command::Action(action) => match action {
+                1 => {
+                    if self.saved.pot.phase != Phase::Settled {
+                        return Err(Error::Rejected(
+                            "previous match payouts are not complete".into(),
+                        ));
+                    }
+                    let folder = self.path.parent().unwrap().join("matches");
+                    std::fs::create_dir_all(&folder).map_err(|e| Error::Internal(e.into()))?;
+                    let archive = folder.join(format!("{}.json", self.saved.pot.id));
+                    self.persist(&archive)?;
+                    self.saved = Self::fresh(&self.wallet).await?;
                 }
-                self.saved.lobby_id = new_id();
-                self.saved.deposits = [None, None];
-                self.save()?;
-                self.prepare().await?;
-            }
-            2 | 3 => {
-                if self.lobby().await?.phase != LobbyPhase::Funding {
-                    return Err(Error::Rejected("lobby is not awaiting payment".into()));
-                }
-                let i = (action - 2) as usize;
-                if let Some(deposit) = &self.saved.deposits[i] {
-                    let hash = self
-                        .wallet
-                        .decode_invoice(&deposit.bolt11)
-                        .map_err(Error::Internal)?
-                        .payment_hash;
+                2 | 3 => {
+                    if self.saved.pot.phase != Phase::Funding {
+                        return Err(Error::Rejected(
+                            "match is not awaiting entry payment".into(),
+                        ));
+                    }
+                    let player = (action - 2) as usize;
                     self.wallet.set_invoice_state(
-                        &hash,
+                        &self.saved.hashes[player],
                         InvoiceState::Paid {
-                            amount_sats: deposit.amount_sats,
+                            amount_sats: self.saved.pot.entry_sats,
                         },
                     );
-                    self.saved.deposits[i] = Some(
-                        self.engine
-                            .deposit(&self.saved.players[i].token, &deposit.id)
-                            .await?,
-                    );
+                }
+                4 => self.saved.pot.start()?,
+                5 | 8 => self.saved.pot.finish(None)?,
+                6 | 7 => self.saved.pot.finish(Some((action - 6) as usize))?,
+                _ => return Err(Error::Rejected("unknown prepaid match action".into())),
+            },
+        }
+        self.save()?;
+        self.reconcile().await
+    }
+    async fn reconcile(&mut self) -> Result<()> {
+        for player in 0..2 {
+            if !self.saved.pot.paid[player] && self.saved.pot.phase == Phase::Funding {
+                match self
+                    .wallet
+                    .invoice_state(&self.saved.hashes[player])
+                    .await?
+                {
+                    InvoiceState::Paid { amount_sats } => {
+                        self.saved.pot.confirm_entry(player, amount_sats)?;
+                        self.save()?;
+                    }
+                    InvoiceState::Pending => (),
+                    InvoiceState::Expired => {
+                        let invoice = self
+                            .wallet
+                            .create_invoice(self.saved.pot.entry_sats, &self.saved.pot.id, 600)
+                            .await?;
+                        self.saved.invoices[player] = invoice.bolt11;
+                        self.saved.hashes[player] = invoice.payment_hash;
+                        self.save()?;
+                    }
+                }
+            }
+        }
+        for index in 0..self.saved.pot.payouts.len() {
+            let payout = self.saved.pot.payouts[index].clone();
+            // This is a simulated receiving destination, NOT a real Lightning invoice.
+            let invoice = format!(
+                "lnfake:{}:player-{}-{}",
+                payout.sats,
+                payout.player + 1,
+                payout.id
+            );
+            let hash = self.wallet.decode_invoice(&invoice)?.payment_hash;
+            let state = match payout.state {
+                PayoutState::Paid => continue,
+                PayoutState::Failed => {
+                    return Err(Error::Rejected("payout failed; needs attention".into()));
+                }
+                PayoutState::Created => {
+                    self.saved.pot.begin_payout(index)?;
+                    self.save()?; // Durable intent before the external call.
+                    self.wallet
+                        .pay_invoice(&invoice, 0)
+                        .await
+                        .unwrap_or(PaymentState::Pending)
+                }
+                PayoutState::InFlight => self.wallet.payment_state(&hash).await?,
+            };
+            match state {
+                PaymentState::Succeeded { fee_sats: 0 } => {
+                    self.saved.pot.confirm_payout(index)?;
                     self.save()?;
                 }
-                self.engine
-                    .ready_lobby(&self.saved.players[i].token, &self.saved.lobby_id)
-                    .await?;
-            }
-            4 => {
-                self.engine
-                    .start_lobby(&self.saved.players[0].token, &self.saved.lobby_id)
-                    .await?;
-            }
-            5 => {
-                self.engine
-                    .cancel_lobby(&self.saved.players[0].token, &self.saved.lobby_id)
-                    .await?;
-            }
-            6..=8 => {
-                if self.lobby().await?.phase != LobbyPhase::Playing {
-                    return Err(Error::Rejected("only a started session can finish".into()));
+                PaymentState::Succeeded { .. } => {
+                    return Err(Error::Rejected("unexpected fee in fake payout".into()));
                 }
-                for i in 0..2 {
-                    self.engine
-                        .report_match(
-                            &self.saved.players[i].token,
-                            MatchReport {
-                                protocol_version: PROTOCOL_VERSION,
-                                match_id: self.saved.lobby_id.clone(),
-                                mode: MatchMode::Local,
-                                reporter_port: i as u8,
-                                players: self.roster(),
-                                hits: vec![],
-                                winner_port: if action == 8 {
-                                    None
-                                } else {
-                                    Some((action - 6) as u8)
-                                },
-                            },
-                        )
-                        .await?;
+                PaymentState::Pending => (),
+                PaymentState::Failed { reason } => {
+                    self.saved.pot.payouts[index].state = PayoutState::Failed;
+                    self.save()?;
+                    return Err(Error::Rejected(reason));
                 }
             }
-            _ => return Err(Error::Rejected("unknown local preview action".into())),
         }
         Ok(())
     }
-
-    async fn view(&self) -> Result<LocalView> {
-        let lobby = self.lobby().await?;
-        let phase = match lobby.phase {
-            LobbyPhase::Funding => 1,
-            LobbyPhase::Ready => 2,
-            LobbyPhase::Playing => 3,
-            LobbyPhase::Settled => 4,
-            LobbyPhase::Cancelled => 5,
-            LobbyPhase::Disputed => 6,
-        };
+    fn view(&self) -> Result<LocalView> {
+        let pot = &self.saved.pot;
         let mut view = LocalView {
-            phase,
+            phase: match pot.phase {
+                Phase::Funding => 1,
+                Phase::Ready => 2,
+                Phase::Playing => 3,
+                Phase::Settling => 6,
+                Phase::Settled => 4,
+            },
             busy: 0,
+            entry_sats: pot.entry_sats,
+            sats_per_percent: pot.sats_per_percent,
+            paid_sats: pot.paid.map(|paid| if paid { pot.entry_sats } else { 0 }),
+            remaining_sats: pot.remaining,
+            earned_sats: pot.earned,
+            pending_sats: pot.pending(),
             ..LocalView::default()
         };
-        for (i, slot) in lobby.players.iter().enumerate() {
-            view.available_sats[i] = slot.available_sats;
-            view.reserved_sats[i] = slot.reserved_sats;
-            if let Some(deposit) = &self.saved.deposits[i] {
-                if deposit.status == DepositStatus::Pending {
-                    text(&mut view.invoices[i], &deposit.bolt11);
-                }
-            }
+        for i in 0..2 {
+            text(&mut view.invoices[i], &self.saved.invoices[i]);
         }
         Ok(view)
     }
 }
-
-fn new_id() -> String {
-    format!("local-{:032x}", rand::random::<u128>())
-}
 fn text<const N: usize>(buffer: &mut [u8; N], value: &str) {
     buffer.fill(0);
-    let bytes = value.as_bytes();
-    let length = bytes.len().min(N - 1);
-    buffer[..length].copy_from_slice(&bytes[..length]);
+    let length = value.len().min(N - 1);
+    buffer[..length].copy_from_slice(&value.as_bytes()[..length]);
 }
 
 pub struct LocalHandle {
-    sender: SyncSender<u32>,
+    sender: SyncSender<Command>,
     shared: Arc<Mutex<LocalView>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -353,7 +340,7 @@ pub unsafe extern "C" fn arena_local_create(folder: *const c_char) -> *mut Local
                     let processed_action = match receiver.recv_timeout(Duration::from_millis(100)) {
                         Ok(action) => {
                             message = runtime
-                                .block_on(demo.action(action))
+                                .block_on(demo.command(action))
                                 .err()
                                 .map(|e| e.to_string())
                                 .unwrap_or_default();
@@ -362,7 +349,10 @@ pub unsafe extern "C" fn arena_local_create(folder: *const c_char) -> *mut Local
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => false,
                     };
-                    if let Ok(mut view) = runtime.block_on(demo.view()) {
+                    if let Err(error) = runtime.block_on(demo.reconcile()) {
+                        message = error.to_string();
+                    }
+                    if let Ok(mut view) = demo.view() {
                         let mut previous = target.lock().unwrap();
                         // A command can arrive while an idle snapshot is being
                         // built. Only its processed acknowledgement may clear
@@ -376,7 +366,6 @@ pub unsafe extern "C" fn arena_local_create(folder: *const c_char) -> *mut Local
                         *previous = view;
                     }
                 }
-                let _ = runtime.block_on(demo.engine.shutdown());
             });
         let Ok(worker) = worker else {
             return std::ptr::null_mut();
@@ -428,7 +417,7 @@ pub unsafe extern "C" fn arena_local_action(handle: *const LocalHandle, action: 
         if view.busy != 0 {
             return false;
         }
-        if handle.sender.try_send(action).is_err() {
+        if handle.sender.try_send(Command::Action(action)).is_err() {
             return false;
         }
         view.busy = 1;
@@ -464,15 +453,47 @@ fn ffi_guard<T>(action: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).ok()
 }
 
+/// # Safety
+/// Handle is live. Counters are cumulative finalized attributed damage for the
+/// current admitted match, in hundredths of a percent. Never pass speculative data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_local_credit(
+    handle: *const LocalHandle,
+    p1_damage_centi: u64,
+    p2_damage_centi: u64,
+) -> bool {
+    ffi_guard(|| {
+        if handle.is_null() {
+            return false;
+        }
+        let handle = unsafe { &*handle };
+        let Ok(mut view) = handle.shared.try_lock() else {
+            return false;
+        };
+        if view.busy != 0 || view.phase != 3 {
+            return false;
+        }
+        if handle
+            .sender
+            .try_send(Command::Credit([p1_damage_centi, p2_damage_centi]))
+            .is_err()
+        {
+            return false;
+        }
+        view.busy = 1;
+        true
+    })
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     struct Handle(*mut LocalHandle);
     impl Handle {
         fn open(path: &Path) -> Self {
-            let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-            let handle = Self(unsafe { arena_local_create(path.as_ptr()) });
+            let folder = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let handle = Self(unsafe { arena_local_create(folder.as_ptr()) });
             assert!(!handle.0.is_null());
             handle.wait(|v| v.phase != 0 && v.busy == 0);
             handle
@@ -482,13 +503,10 @@ mod tests {
             loop {
                 let mut view = LocalView::default();
                 if unsafe { arena_local_snapshot(self.0, &mut view) } && ready(&view) {
-                    assert_ne!(view.phase, 7);
+                    assert_ne!(view.phase, 7, "{}", String::from_utf8_lossy(&view.error));
                     return view;
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "local worker failed to respond"
-                );
+                assert!(std::time::Instant::now() < deadline, "worker timeout");
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
@@ -497,77 +515,107 @@ mod tests {
             assert!(unsafe { arena_local_action(self.0, action) });
             self.wait(|v| v.busy == 0)
         }
+        fn credit(&self, totals: [u64; 2]) -> LocalView {
+            self.wait(|v| v.busy == 0);
+            assert!(unsafe { arena_local_credit(self.0, totals[0], totals[1]) });
+            self.wait(|v| v.busy == 0)
+        }
+        fn fund(&self) {
+            assert_eq!(self.action(4).phase, 1);
+            assert_eq!(self.action(2).paid_sats, [500, 0]);
+            assert_eq!(self.action(4).phase, 1);
+            assert_eq!(self.action(3).phase, 2);
+            assert_eq!(self.action(4).phase, 3);
+        }
     }
     impl Drop for Handle {
         fn drop(&mut self) {
-            unsafe {
-                arena_local_destroy(self.0);
-            }
+            unsafe { arena_local_destroy(self.0) }
         }
     }
 
     #[test]
-    fn c_abi_full_funding_start_settlement_and_restart_flow() {
-        assert_eq!(std::mem::size_of::<LocalView>(), 576);
+    fn two_fresh_invoices_live_outgoing_payout_then_winner_pot_and_new_invoices() {
+        assert_eq!(std::mem::size_of::<LocalView>(), 616);
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
-        assert_eq!(host.action(4).phase, 1); // Start is denied before payments.
-        let one = host.action(2);
-        assert_eq!(one.phase, 1);
-        assert_eq!(one.reserved_sats, [500, 0]);
+        let initial = host.wait(|v| v.busy == 0);
+        assert!(initial.invoices.iter().all(|v| v[0] != 0));
+        assert_ne!(initial.invoices[0], initial.invoices[1]);
+        host.fund();
+        let live = host.credit([0, 800]);
+        assert_eq!(live.earned_sats, [80, 0]);
+        assert_eq!(live.remaining_sats, [500, 420]);
+        assert_eq!(live.phase, 3);
+        assert_eq!(host.credit([0, 800]).earned_sats, [80, 0]);
+        let end = host.action(7); // P2 wins: all 920 remaining sats go to P2.
+        assert_eq!(end.earned_sats, [80, 920]);
+        assert_eq!(end.phase, 4);
+        assert_eq!(host.action(7).earned_sats, [80, 920]); // Duplicate end is harmless.
+        let next = host.action(1);
+        assert_eq!(next.phase, 1);
+        assert_eq!(next.paid_sats, [0, 0]);
+        assert_eq!(next.remaining_sats, [0, 0]);
+        assert_eq!(next.earned_sats, [0, 0]);
+        assert_ne!(next.invoices[0], initial.invoices[0]);
+        assert_ne!(next.invoices[1], initial.invoices[1]);
         assert_eq!(host.action(4).phase, 1);
-        assert_eq!(host.action(3).phase, 2);
-        assert_eq!(host.action(4).phase, 3);
-        assert!(host.action(4).error[0] != 0); // Authorization cannot be reused.
-        let settled = host.action(6);
-        assert_eq!(settled.phase, 4);
-        assert_eq!(settled.available_sats, [600, 400]);
-        assert_eq!(settled.reserved_sats, [0, 0]);
-        drop(host);
-        let recovered = Handle::open(dir.path());
-        assert_eq!(recovered.wait(|v| v.busy == 0).available_sats, [600, 400]);
-        assert_eq!(recovered.action(1).phase, 1); // P1 reuses balance; P2 needs only 100.
     }
 
     #[test]
-    fn ready_reservations_survive_restart_and_cancel_releases_them_once() {
+    fn restart_keeps_paid_entries_and_payout_ids_without_reusing_winnings() {
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
-        host.action(2);
-        assert_eq!(host.action(3).phase, 2);
+        host.fund();
+        host.credit([0, 800]);
         drop(host);
-        let recovered = Handle::open(dir.path());
-        assert_eq!(recovered.wait(|v| v.busy == 0).reserved_sats, [500, 500]);
-        let cancelled = recovered.action(5);
-        assert_eq!(cancelled.phase, 5);
-        assert_eq!(cancelled.available_sats, [500, 500]);
-        assert_eq!(recovered.action(5).available_sats, [500, 500]);
+        let host = Handle::open(dir.path());
+        assert_eq!(host.credit([0, 800]).earned_sats, [80, 0]);
+        assert_eq!(host.action(8).earned_sats, [580, 420]); // Return unspent contributions.
+        drop(host);
+        let host = Handle::open(dir.path());
+        assert_eq!(host.action(1).paid_sats, [0, 0]);
     }
 
     #[test]
-    fn invalid_ffi_inputs_are_rejected_without_a_panic() {
+    fn recovered_unknown_outgoing_payment_is_looked_up_not_sent_twice() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut demo = Demo::open(dir.path()).await.unwrap();
+            demo.saved.pot.confirm_entry(0, 500).unwrap();
+            demo.saved.pot.confirm_entry(1, 500).unwrap();
+            demo.saved.pot.start().unwrap();
+            demo.saved.pot.credit([0, 800]).unwrap();
+            demo.saved.pot.begin_payout(0).unwrap();
+            demo.save().unwrap(); // Crash before a conclusive outgoing acknowledgement.
+            drop(demo);
+            let mut recovered = Demo::open(dir.path()).await.unwrap();
+            recovered.reconcile().await.unwrap();
+            assert_eq!(recovered.wallet.payment_attempts(), 0);
+            assert_eq!(recovered.view().unwrap().pending_sats, [80, 0]);
+            assert_eq!(recovered.view().unwrap().earned_sats, [0, 0]);
+            recovered.command(Command::Action(7)).await.unwrap();
+            assert_eq!(recovered.saved.pot.phase, Phase::Settling);
+            assert_eq!(recovered.saved.pot.earned, [0, 920]);
+            assert_eq!(recovered.wallet.payment_attempts(), 1); // Only the new winner payout.
+            assert!(recovered.command(Command::Action(1)).await.is_err());
+        });
+    }
+
+    #[test]
+    fn null_ffi_inputs_fail_without_unwinding() {
         unsafe {
             assert!(arena_local_create(std::ptr::null()).is_null());
-            assert!(!arena_local_action(std::ptr::null(), 4));
+            assert!(!arena_local_credit(std::ptr::null(), 0, 800));
             assert!(!arena_local_snapshot(
                 std::ptr::null(),
                 std::ptr::null_mut()
             ));
             arena_local_destroy(std::ptr::null_mut());
-        }
-    }
-
-    #[test]
-    fn queued_actions_are_not_acknowledged_by_idle_snapshots() {
-        let dir = tempfile::tempdir().unwrap();
-        let host = Handle::open(dir.path());
-        host.action(2);
-        assert_eq!(host.action(3).phase, 2);
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(101));
-            assert_eq!(host.action(4).phase, 3);
-            assert_eq!(host.action(8).phase, 4);
-            assert_eq!(host.action(1).phase, 2);
         }
     }
 }
