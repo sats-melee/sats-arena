@@ -479,17 +479,8 @@ impl Demo {
         saved.activity.clear();
         saved.events.clear();
         saved.log_version = 1;
-        if saved.pot.phase == Phase::Funding && !saved.pot.paid.iter().any(|p| *p) {
-            let rate = std::env::var("SATS_ARENA_SATS_PER_PERCENT").unwrap_or_else(|_| "1".into());
-            let rate = rate
-                .parse::<u64>()
-                .map_err(|_| Error::Rejected("invalid SATS_ARENA_SATS_PER_PERCENT".into()))?;
-            // Validate bounds without changing any already-funded match agreement.
-            MatchPot::new("settings".into(), saved.pot.entry_sats, rate)?;
-            saved.pot.sats_per_percent = rate;
-        }
         saved.schema = 3;
-        let demo = Self {
+        let mut demo = Self {
             wallet,
             provider,
             verifier,
@@ -502,8 +493,55 @@ impl Demo {
             next_retired_poll: std::time::Instant::now(),
             _state_lock: state_lock,
         };
+        if demo.saved.pot.phase == Phase::Funding && !demo.saved.pot.paid.iter().any(|p| *p) {
+            let setting = |name: &str, default: u64| -> Result<u64> {
+                match std::env::var(name) {
+                    Ok(value) => value
+                        .parse()
+                        .map_err(|_| Error::Rejected(format!("invalid {name}"))),
+                    Err(_) => Ok(default),
+                }
+            };
+            let entry = setting("SATS_ARENA_ENTRY_SATS", demo.saved.pot.entry_sats)?;
+            let rate = setting("SATS_ARENA_SATS_PER_PERCENT", 1)?;
+            demo.update_unfunded_settings(entry, rate).await?;
+        }
         demo.save()?;
         Ok(demo)
+    }
+    async fn update_unfunded_settings(&mut self, entry: u64, rate: u64) -> Result<()> {
+        // Never rewrite an agreement after even one player's entry was paid.
+        if self.saved.pot.phase != Phase::Funding || self.saved.pot.paid.iter().any(|p| *p) {
+            return Ok(());
+        }
+        MatchPot::new("settings".into(), entry, rate)?;
+        if self.saved.pot.entry_sats == entry && self.saved.pot.sats_per_percent == rate {
+            return Ok(());
+        }
+        // Retire at the old amount, so a late payment is returned to its original
+        // recipient and cannot accidentally fund the changed match.
+        self.retire_entries();
+        self.save()?;
+        self.saved.pot.entry_sats = entry;
+        self.saved.pot.sats_per_percent = rate;
+        if self.simulation.is_some() {
+            for player in 0..4 {
+                if self.saved.pot.kinds[player] == 0 {
+                    let invoice = self
+                        .wallet
+                        .create_invoice(
+                            entry,
+                            &format!("{} P{}", self.saved.pot.id, player + 1),
+                            600,
+                        )
+                        .await
+                        .map_err(Error::Internal)?;
+                    self.saved.invoices[player] = invoice.bolt11;
+                    self.saved.hashes[player] = invoice.payment_hash;
+                }
+            }
+        }
+        self.save()
     }
     fn save(&self) -> Result<()> {
         self.persist(&self.path)
@@ -1763,6 +1801,56 @@ pub unsafe extern "C" fn arena_local_addresses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn changed_unfunded_settings_retire_old_invoice_amounts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut demo = Demo::open(dir.path()).await.unwrap();
+            let old_hash = demo.saved.hashes[0].clone();
+            demo.saved.addresses[0] = "alice@example.test".into();
+            demo.update_unfunded_settings(400, 2).await.unwrap();
+            assert_eq!(demo.saved.pot.entry_sats, 400);
+            assert_eq!(demo.saved.pot.sats_per_percent, 2);
+            let old = demo
+                .saved
+                .retired_entries
+                .iter()
+                .find(|e| e.incoming_hash == old_hash)
+                .unwrap();
+            assert_eq!(old.expected_sats, 500);
+            assert_eq!(old.address, "alice@example.test");
+            assert_ne!(demo.saved.hashes[0], old_hash);
+            assert_eq!(
+                demo.wallet
+                    .decode_invoice(&demo.saved.invoices[0])
+                    .unwrap()
+                    .amount_sats,
+                Some(400)
+            );
+        });
+    }
+    #[test]
+    fn changed_settings_preserve_a_partially_funded_agreement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut demo = Demo::open(dir.path()).await.unwrap();
+            demo.saved.pot.confirm_entry(0, 500).unwrap();
+            let invoices = demo.saved.invoices.clone();
+            demo.update_unfunded_settings(400, 2).await.unwrap();
+            assert_eq!(demo.saved.pot.entry_sats, 500);
+            assert_eq!(demo.saved.pot.sats_per_percent, 1);
+            assert_eq!(demo.saved.invoices, invoices);
+            assert!(demo.saved.retired_entries.is_empty());
+        });
+    }
     struct Handle(*mut LocalHandle);
     impl Handle {
         fn open(path: &Path) -> Self {
