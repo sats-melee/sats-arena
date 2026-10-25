@@ -10,6 +10,7 @@ name = "sats_arena_local"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+anyhow = "1"
 fs2 = "0.4"
 sats-arena-core = { workspace = true }
 serde = { workspace = true }
@@ -18,6 +19,5 @@ rand = "0.9"
 tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
-anyhow = "1"
 async-trait = "0.1"
 tempfile = "3"

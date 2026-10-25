@@ -69,10 +69,26 @@ impl NwcWallet {
         }
         let identity = hex::encode(hash.finalize());
         let client = NostrWalletConnect::builder(uri).timeout(timeout).build();
-        let info = tokio::time::timeout(timeout, async { client.get_info().await })
-            .await
-            .map_err(|_| anyhow!("NWC wallet connection timed out"))?
-            .map_err(|_| anyhow!("NWC wallet connection or authorization failed"))?;
+        let info = match tokio::time::timeout(timeout, async { client.get_info().await }).await {
+            Ok(Ok(info)) => info,
+            failure => {
+                client.shutdown().await;
+                let timed_out = match failure {
+                    Err(_) => true,
+                    Ok(Err(error)) => error.kind() == ::nwc::error::ErrorKind::NoResponse,
+                    _ => false,
+                };
+                return Err(if timed_out {
+                    anyhow!(
+                        "NWC wallet connection timed out: no reply to get_info. Check the wallet is online and unlocked, and the connection is still active."
+                    )
+                } else {
+                    anyhow!(
+                        "NWC wallet connection or authorization failed. Check the saved connection and wallet permissions."
+                    )
+                });
+            }
+        };
         for required in [
             Method::MakeInvoice,
             Method::LookupInvoice,

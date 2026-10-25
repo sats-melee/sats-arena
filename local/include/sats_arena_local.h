@@ -54,6 +54,8 @@ bool arena_local_roster(const ArenaLocalHandle*, uint32_t teams, const uint32_t*
 /* Ordered finalized credits. Retry-safe sequences start at1 each match. */
 bool arena_local_credits(const ArenaLocalHandle*, const ArenaLocalCredit*, uint32_t count);
 void arena_local_destroy(ArenaLocalHandle*);
+/* Standalone connection/invoice check: no ledger access and no outgoing payment. */
+bool arena_wallet_check(const char* config, bool create_invoice, char* out, uint32_t size);
 #ifdef __cplusplus
 }
 #endif

@@ -19,6 +19,28 @@ See `slippi-launcher/docs/sandbox.md` for agent-friendly setup and test commands
 
 ## Configure and launch
 
+Wallet settings check a saved NWC connection when opened and after saving.
+The green check means the wallet replied to `get_info` and advertises the
+required methods. **Check connection** retries that read-only check.
+**Generate test invoice** separately creates a 1-sat invoice with a ten-minute
+expiry, validates its BOLT11 signature/amount, looks up its pending state,
+and displays the invoice and a scannable QR. Neither action pays an invoice or
+opens a match ledger. A saved string alone is not treated as verified.
+
+The bundled `sats-arena-wallet-check` executable uses the same Rust NWC adapter
+as the game. Its credential arrives over private stdin, and only a redacted
+result and optional invoice/QR return to the renderer. The developer wrapper
+is `Ishiiruka/Tools/arena/check-wallet.sh`; `--invoice` explicitly opts into
+invoice creation. Do not pass credentials on its command line.
+
+A timeout means the wallet did not answer; it does not prove the secret is
+invalid. Check that its wallet/Hub is online and unlocked and the connection
+has not expired or been revoked. Reachable relays can still serve an old
+public capabilities event while the wallet is offline. `core/examples/nwc_probe.rs`
+can diagnose read-only replies with negotiated, NIP44, and NIP04 encryption,
+without printing wallet errors or sending payments. Live diagnostics require
+explicit user authorization; routine development uses Sandbox.
+
 In the launcher, choose **Wallet → Nostr Wallet Connect**, save the connection,
 select the Melee ISO, then **Play local Arena**. The main process reads the
 existing protected secret store. The renderer can inspect saved/encrypted status,

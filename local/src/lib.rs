@@ -1,6 +1,7 @@
 //! Wallet-neutral local host for up to four funded humans and CPU participants.
 //! Simulated wallet, live receiving verification, ordered damage and team settlement.
 mod config;
+mod wallet_check;
 
 use sats_arena_core::{
     Error, Result,
