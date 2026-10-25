@@ -1,6 +1,6 @@
 [package]
 name = "sats-arena-local"
-description = "Fake-only embedded funding preview for Dolphin; no listener or real wallet"
+description = "Embedded match funding and NWC wallet host for Dolphin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ name = "sats_arena_local"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+fs2 = "0.4"
 sats-arena-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

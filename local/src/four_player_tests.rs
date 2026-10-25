@@ -575,3 +575,14 @@ fn one_sat_default_updates_unfunded_lobbies_but_preserves_paid_agreements() {
         assert_eq!(demo.saved.pot.sats_per_percent, 10);
     });
 }
+
+#[test]
+fn one_process_owns_a_financial_state_folder_until_it_closes() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Demo::open(dir.path()).await.unwrap();
+        assert!(Demo::open(dir.path()).await.is_err());
+        drop(first);
+        assert!(Demo::open(dir.path()).await.is_ok());
+    });
+}

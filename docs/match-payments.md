@@ -52,8 +52,11 @@ state migrates from two slots while retaining funds, payout IDs and fractional
 carry. Completed games are archived before creating the next pot.
 
 The wallet/provider interfaces are independent of NWC or another backend.
-The GUI currently uses simulated funding and outgoing payments; receiving
-verification alone uses live LNURL/BOLT11. No real sats move in gameplay tests.
+The launcher selects either simulated execution or a saved NWC connection.
+An explicit developer environment URI can override that selection. The NWC
+adapter uses actual receiving invoices, confirmations and payouts; verification
+alone never selects a live wallet. Automated tests use simulated wallets or
+an encrypted local mock relay, without moving real sats.
 Fees belong to the wallet execution budget, outside the advertised match pots.
 
 At every transition, contributed sats equal remaining contributions plus open

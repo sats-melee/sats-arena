@@ -52,9 +52,9 @@ The shared Rust core exposes independent interfaces:
 
 The local host accepts injected `Arc<dyn Wallet>` and
 `Arc<dyn AddressInvoices>` through `open_with`. The public GUI factory still
-selects the fake implementations. Real NWC connection/setup remains a separate
-integration; neither entering an address nor generating a fake receipt connects
-a real wallet.
+selects fake implementations or the real NWC adapter according to the launcher
+handoff (with an explicit developer environment override). Entering a receiving
+address alone does not select a live funding wallet.
 
 A production address provider implements [LUD-16](https://github.com/lnurl/luds/blob/luds/16.md)
 and [LUD-06](https://github.com/lnurl/luds/blob/luds/06.md): HTTPS discovery,
@@ -65,7 +65,7 @@ The current fake payout provider never contacts the entered domain. The real
 separate live `AddressVerifier` used by the GUI. See
 [address verification](address-verification.md).
 
-An NWC wallet adapter maps the wallet operations to make_invoice,
+The NWC wallet adapter maps the wallet operations to make_invoice,
 lookup_invoice and pay_invoice as supported by the connected wallet, and uses
 a BOLT11 decoder for local validation. The batch scheduler is unchanged.
 See [NWC's payment flow](https://docs.nwc.dev/introduction/introduction-to-nwc).
@@ -80,8 +80,10 @@ failure stays visible and does not unlock a new funded match.
 The host has bounded wallet/resolver timeouts. Fees are separate from the
 advertised match funds; the adapter receives the configured fee limit
 (`SATS_ARENA_MAX_PAYOUT_FEE_SATS`, default 10 sats per outgoing payment).
-Fake fees are zero. Fake state is marked and cannot be opened with a real
-wallet mode.
+Fake fees are zero. Standard NWC cannot enforce that per-payment cap; NWC uses
+an explicit wallet-managed policy instead and rejects a finite app cap before
+submission. Fake and live states are separate and live state is bound to public
+wallet-connection identity. See [NWC execution](nwc-local-wallet.md).
 
 ## Verification
 

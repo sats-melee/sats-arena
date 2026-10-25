@@ -78,9 +78,9 @@ unsupported limits and payer data, unsafe URLs, stale checks, failed providers
 and funding gates.
 
 The `LnurlClient` implements both `AddressVerifier` and `AddressInvoices`.
-It can resolve real receiving invoices for a future NWC wallet adapter without
-changing gameplay or batching. The GUI still uses a simulated funding/payout
-wallet; its live address verification does not enable real payments.
+It resolves fresh receiving invoices for the NWC adapter without changing
+gameplay or batching. The launcher selects fake or NWC execution; verification
+alone does not switch modes. See [NWC setup](nwc-local-wallet.md).
 
 Protocol references:
 [LUD-16](https://github.com/lnurl/luds/blob/luds/16.md),

@@ -1,5 +1,7 @@
 //! Wallet-neutral local host for up to four funded humans and CPU participants.
 //! Simulated wallet, live receiving verification, ordered damage and team settlement.
+mod config;
+
 use sats_arena_core::{
     Error, Result,
     arena_pot::{Credit, MatchPot},
@@ -107,6 +109,12 @@ struct Roster {
 struct Saved {
     schema: u32,
     #[serde(default)]
+    wallet_identity: Option<String>,
+    #[serde(default)]
+    invoice_addresses: [String; 4],
+    #[serde(default)]
+    retired_entries: Vec<RetiredEntry>,
+    #[serde(default)]
     roster: Option<Roster>,
     #[serde(default)]
     next_roster: Option<Roster>,
@@ -133,6 +141,16 @@ struct Saved {
     simulated: bool,
     #[serde(default)]
     verification: [AddressCheck; 4],
+}
+#[derive(Serialize, Deserialize, Clone)]
+struct RetiredEntry {
+    incoming_hash: String,
+    player: usize,
+    address: String,
+    expected_sats: u64,
+    received_sats: Option<u64>,
+    prepared: Option<PreparedPayout>,
+    state: PayoutState,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct Activity {
@@ -170,9 +188,20 @@ struct Demo {
     simulation: Option<Arc<FakeWallet>>,
     saved: Saved,
     path: PathBuf,
+    retired_cursor: usize,
+    next_invoice_poll: std::time::Instant,
+    next_retired_poll: std::time::Instant,
+    _state_lock: std::fs::File,
 }
 impl Demo {
     async fn fresh(wallet: &dyn Wallet, simulated: bool) -> Result<Saved> {
+        Self::fresh_for(wallet, simulated, None).await
+    }
+    async fn fresh_for(
+        wallet: &dyn Wallet,
+        simulated: bool,
+        roster: Option<&Roster>,
+    ) -> Result<Saved> {
         let setting = |name: &str, default: u64| -> Result<u64> {
             match std::env::var(name) {
                 Ok(value) => value
@@ -181,14 +210,20 @@ impl Demo {
                 Err(_) => Ok(default),
             }
         };
-        let pot = MatchPot::new(
+        let mut pot = MatchPot::new(
             format!("match-{:032x}", rand::random::<u128>()),
             setting("SATS_ARENA_ENTRY_SATS", 500)?,
             setting("SATS_ARENA_SATS_PER_PERCENT", 1)?,
         )?;
+        if let Some(roster) = roster {
+            pot.configure(roster.teams, roster.kinds, roster.team_ids)?;
+        }
         let mut invoices = std::array::from_fn(|_| String::new());
         let mut hashes = std::array::from_fn(|_| String::new());
         for i in 0..4 {
+            if !simulated || pot.kinds[i] != 0 {
+                continue;
+            }
             let invoice = wallet
                 .create_invoice(pot.entry_sats, &format!("{} P{}", pot.id, i + 1), 600)
                 .await?;
@@ -197,6 +232,9 @@ impl Demo {
         }
         Ok(Saved {
             schema: 3,
+            wallet_identity: None,
+            invoice_addresses: Default::default(),
+            retired_entries: vec![],
             roster: None,
             next_roster: None,
             events: vec![],
@@ -226,6 +264,69 @@ impl Demo {
         )
         .await
     }
+    async fn open_configured(
+        fake_folder: &Path,
+        live_folder: &Path,
+        config: config::WalletConfig,
+    ) -> Result<Self> {
+        match config {
+            config::WalletConfig::Fake => Self::open(fake_folder).await,
+            config::WalletConfig::Nwc(uri) => {
+                use sats_arena_core::wallet::{LnurlClient, NWC_WALLET_MANAGED_FEES, NwcWallet};
+                if std::env::var("SATS_ARENA_MAX_PAYOUT_FEE_SATS")
+                    .ok()
+                    .is_some_and(|v| v.parse::<u64>().ok() != Some(NWC_WALLET_MANAGED_FEES))
+                {
+                    return Err(Error::Rejected("NWC fees are controlled by the wallet connection; remove the unsupported app fee cap".into()));
+                }
+                let wallet =
+                    tokio::time::timeout(Duration::from_secs(30), NwcWallet::connect(uri.expose()))
+                        .await
+                        .map_err(|_| {
+                            Error::Rejected(
+                                "NWC connection timed out; check the launcher wallet and relay"
+                                    .into(),
+                            )
+                        })?
+                        .map_err(|error| Error::Rejected(format!("NWC wallet: {error}")))?;
+                let identity = wallet.identity();
+                if identity.is_empty() || !identity.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(Error::Rejected("Invalid NWC wallet identity".into()));
+                }
+                let folder = live_folder.join(&identity);
+                std::fs::create_dir_all(&folder).map_err(|e| Error::Internal(e.into()))?;
+                let mut demo = Self::open_with(
+                    &folder,
+                    Arc::new(wallet),
+                    Arc::new(LnurlClient),
+                    None,
+                    default_verifier(),
+                )
+                .await?;
+                if demo
+                    .saved
+                    .wallet_identity
+                    .as_ref()
+                    .is_some_and(|old| old != &identity)
+                {
+                    return Err(Error::Rejected(
+                        "Stored match belongs to a different wallet connection".into(),
+                    ));
+                }
+                if demo.saved.wallet_identity.is_none()
+                    && (demo.saved.pot.paid.iter().any(|p| *p) || !demo.saved.prepared.is_empty())
+                {
+                    return Err(Error::Rejected(
+                        "Funded live state is missing its wallet identity".into(),
+                    ));
+                }
+                demo.saved.wallet_identity = Some(identity);
+                demo.saved.max_fee_sats = NWC_WALLET_MANAGED_FEES;
+                demo.save()?;
+                Ok(demo)
+            }
+        }
+    }
     // No NWC/LND-specific behavior below this boundary.
     async fn open_with(
         folder: &Path,
@@ -234,6 +335,24 @@ impl Demo {
         simulation: Option<Arc<FakeWallet>>,
         verifier: Arc<dyn AddressVerifier>,
     ) -> Result<Self> {
+        std::fs::create_dir_all(folder).map_err(|e| Error::Internal(e.into()))?;
+        let mut lock_options = std::fs::OpenOptions::new();
+        lock_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let state_lock = lock_options
+            .open(folder.join(".arena.lock"))
+            .map_err(|e| Error::Internal(e.into()))?;
+        fs2::FileExt::try_lock_exclusive(&state_lock).map_err(|_| {
+            Error::Rejected("This Arena wallet state is already open in another process".into())
+        })?;
         let path = folder.join("prepaid-match.json");
         let mut saved: Saved = if path.exists() {
             let bytes = std::fs::read(&path).map_err(|e| Error::Internal(e.into()))?;
@@ -352,6 +471,10 @@ impl Demo {
             simulation,
             saved,
             path,
+            retired_cursor: 0,
+            next_invoice_poll: std::time::Instant::now(),
+            next_retired_poll: std::time::Instant::now(),
+            _state_lock: state_lock,
         };
         demo.save()?;
         Ok(demo)
@@ -408,13 +531,18 @@ impl Demo {
                     .saturating_mul(1000)
     }
     async fn next_match(&mut self, roster: Option<Roster>) -> Result<()> {
+        self.retire_entries();
+        self.save()?;
         let folder = self.path.parent().unwrap().join("matches");
         std::fs::create_dir_all(&folder).map_err(|e| Error::Internal(e.into()))?;
         self.persist(&folder.join(format!("{}.json", self.saved.pot.id)))?;
-        let mut next = Self::fresh(self.wallet.as_ref(), self.simulation.is_some()).await?;
-        if let Some(ref r) = roster {
-            next.pot.configure(r.teams, r.kinds, r.team_ids)?;
-        }
+        let mut next = Self::fresh_for(
+            self.wallet.as_ref(),
+            self.simulation.is_some(),
+            roster.as_ref(),
+        )
+        .await?;
+        next.retired_entries = self.saved.retired_entries.clone();
         next.roster = roster;
         next.addresses = self.saved.addresses.clone();
         next.verification = self.saved.verification.clone();
@@ -422,6 +550,7 @@ impl Demo {
         next.events = self.saved.events.clone();
         next.activity = self.saved.activity.clone();
         next.max_fee_sats = self.saved.max_fee_sats;
+        next.wallet_identity = self.saved.wallet_identity.clone();
         next.used_payment_hashes = self.saved.used_payment_hashes.clone();
         self.saved = next;
         self.save()
@@ -478,6 +607,9 @@ impl Demo {
                         "payout addresses are locked after entry payment".into(),
                     ));
                 }
+                if self.simulation.is_none() && address.as_str() != self.saved.addresses[player] {
+                    self.retire_entries();
+                }
                 self.saved.addresses[player] = address.as_str().into();
                 self.saved.verification[player] = AddressCheck::default();
                 self.save()?;
@@ -512,6 +644,9 @@ impl Demo {
                     return Err(Error::Rejected(
                         "payout addresses are locked after entry payment".into(),
                     ));
+                }
+                if self.simulation.is_none() && canonical.as_slice() != &self.saved.addresses[..2] {
+                    self.retire_entries();
                 }
                 self.saved.addresses[..2].clone_from_slice(&canonical);
                 self.saved.verification[0] = AddressCheck::default();
@@ -619,6 +754,16 @@ impl Demo {
         Ok(())
     }
     fn require_addresses(&self) -> Result<()> {
+        if self
+            .saved
+            .retired_entries
+            .iter()
+            .any(|entry| entry.received_sats.is_some() && entry.state != PayoutState::Paid)
+        {
+            return Err(Error::Rejected(
+                "A previous entry return is still pending".into(),
+            ));
+        }
         for (player, address) in self.saved.addresses.iter().enumerate() {
             if self.saved.pot.kinds[player] != 0 {
                 continue;
@@ -645,7 +790,224 @@ impl Demo {
         }
         Ok(())
     }
+    fn retire_entry(&mut self, player: usize, received_sats: Option<u64>) {
+        let hash = std::mem::take(&mut self.saved.hashes[player]);
+        self.saved.invoices[player].clear();
+        let address = std::mem::take(&mut self.saved.invoice_addresses[player]);
+        if hash.is_empty() {
+            return;
+        }
+        if let Some(previous) = self
+            .saved
+            .retired_entries
+            .iter_mut()
+            .find(|e| e.incoming_hash == hash)
+        {
+            if received_sats.is_some() {
+                previous.received_sats = received_sats;
+            }
+            return;
+        }
+        self.saved.retired_entries.push(RetiredEntry {
+            incoming_hash: hash,
+            player,
+            address: if address.is_empty() {
+                self.saved.addresses[player].clone()
+            } else {
+                address
+            },
+            expected_sats: self.saved.pot.entry_sats,
+            received_sats,
+            prepared: None,
+            state: PayoutState::Created,
+        });
+    }
+    fn retire_entries(&mut self) {
+        for player in 0..4 {
+            if !self.saved.pot.paid[player] {
+                self.retire_entry(player, None);
+            }
+        }
+    }
+    async fn ensure_entry_invoices(&mut self) -> Result<()> {
+        if self.simulation.is_some()
+            || self.saved.pot.phase != Phase::Funding
+            || self.require_addresses().is_err()
+        {
+            return Ok(());
+        }
+        for player in 0..4 {
+            if self.saved.pot.kinds[player] != 0
+                || self.saved.pot.paid[player]
+                || !self.saved.hashes[player].is_empty()
+            {
+                continue;
+            }
+            let invoice = tokio::time::timeout(
+                Duration::from_secs(15),
+                self.wallet.create_invoice(
+                    self.saved.pot.entry_sats,
+                    &format!("{} Player {}", self.saved.pot.id, player + 1),
+                    600,
+                ),
+            )
+            .await
+            .map_err(|_| Error::WalletUnavailable)??;
+            self.saved.invoices[player] = invoice.bolt11;
+            self.saved.hashes[player] = invoice.payment_hash;
+            self.saved.invoice_addresses[player] = self.saved.addresses[player].clone();
+            self.save()?;
+        }
+        Ok(())
+    }
+    async fn reconcile_retired(&mut self) -> Result<()> {
+        let count = self.saved.retired_entries.len();
+        if count == 0 {
+            return Ok(());
+        }
+        if self.simulation.is_some() || std::time::Instant::now() >= self.next_retired_poll {
+            self.next_retired_poll = std::time::Instant::now() + Duration::from_secs(2);
+            for _ in 0..count.min(4) {
+                let index = self.retired_cursor % count;
+                self.retired_cursor = (self.retired_cursor + 1) % count;
+                let entry = self.saved.retired_entries[index].clone();
+                if entry.received_sats.is_some() || entry.state == PayoutState::Paid {
+                    continue;
+                }
+                if let Ok(InvoiceState::Paid { amount_sats }) =
+                    self.wallet.invoice_state(&entry.incoming_hash).await
+                {
+                    self.saved.retired_entries[index].received_sats = Some(amount_sats);
+                    self.event(format!(
+                        "Late Player {} invoice paid — {} sats; returning to original address",
+                        entry.player + 1,
+                        amount_sats
+                    ));
+                    self.save()?;
+                }
+                // Expired/unknown entries remain monitored: settlement can race expiry.
+            }
+        }
+        for index in 0..count {
+            let entry = self.saved.retired_entries[index].clone();
+            let Some(sats) = entry.received_sats else {
+                continue;
+            };
+            if entry.state == PayoutState::Paid {
+                continue;
+            }
+            if sats == 0 {
+                self.saved.retired_entries[index].state = PayoutState::Paid;
+                self.save()?;
+                continue;
+            }
+            if entry.state == PayoutState::Failed {
+                return Err(Error::Rejected(
+                    "A late entry return failed and needs attention".into(),
+                ));
+            }
+            let id = format!("late-entry-{}", entry.incoming_hash);
+            if entry.prepared.is_none() {
+                if entry.state == PayoutState::InFlight {
+                    return Err(Error::Rejected(
+                        "Missing prepared invoice for a late return".into(),
+                    ));
+                }
+                let address = parse_address(&entry.address).map_err(|_| {
+                    Error::Rejected(
+                        "Late entry needs its original receiving address restored".into(),
+                    )
+                })?;
+                let prepared = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    prepare_payout(
+                        self.wallet.as_ref(),
+                        self.provider.as_ref(),
+                        &address,
+                        sats,
+                        &id,
+                    ),
+                )
+                .await
+                .map_err(|_| Error::WalletUnavailable)??;
+                if !self
+                    .saved
+                    .used_payment_hashes
+                    .insert(prepared.payment_hash.clone())
+                {
+                    return Err(Error::Rejected(
+                        "Recipient reused a payment hash for a late entry return".into(),
+                    ));
+                }
+                self.saved.retired_entries[index].prepared = Some(prepared);
+                self.save()?;
+            }
+            let prepared = self.saved.retired_entries[index].prepared.clone().unwrap();
+            let state = if entry.state == PayoutState::Created {
+                self.saved.retired_entries[index].state = PayoutState::InFlight;
+                self.save()?;
+                match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.wallet
+                        .pay_invoice(&prepared.invoice, self.saved.max_fee_sats),
+                )
+                .await
+                {
+                    Ok(Ok(state)) => state,
+                    _ => PaymentState::Pending,
+                }
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.wallet.payment_state(&prepared.payment_hash),
+                )
+                .await
+                .map_err(|_| Error::WalletUnavailable)??
+            };
+            match state {
+                PaymentState::Succeeded { .. } => {
+                    let at_ms = now_ms();
+                    self.saved.retired_entries[index].state = PayoutState::Paid;
+                    self.saved.retired_entries[index]
+                        .prepared
+                        .as_mut()
+                        .unwrap()
+                        .confirmed_at_ms = Some(at_ms);
+                    let receipt = Receipt {
+                        id,
+                        at_ms,
+                        player: entry.player,
+                        address: entry.address,
+                        sats,
+                        detail: "Late entry return".into(),
+                    };
+                    let message = receipt_message(&receipt, self.saved.simulated);
+                    self.saved.receipts.push(receipt);
+                    if self.saved.receipts.len() > 100 {
+                        self.saved.receipts.remove(0);
+                    }
+                    self.record_activity(at_ms, message);
+                    self.save()?;
+                }
+                PaymentState::Pending => (),
+                PaymentState::Failed { .. } => {
+                    self.saved.retired_entries[index].state = PayoutState::Failed;
+                    self.save()?;
+                    return Err(Error::Rejected(
+                        "A late entry return failed and needs attention".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
     async fn reconcile(&mut self) -> Result<()> {
+        self.ensure_entry_invoices().await?;
+        let poll_entries =
+            self.simulation.is_some() || std::time::Instant::now() >= self.next_invoice_poll;
+        if poll_entries {
+            self.next_invoice_poll = std::time::Instant::now() + Duration::from_secs(2);
+        }
         let previous_count = self.saved.pot.payouts.len();
         self.saved.pot.flush_due(now_ms());
         if previous_count != self.saved.pot.payouts.len() {
@@ -655,6 +1017,8 @@ impl Demo {
             if self.saved.pot.kinds[player] == 0
                 && !self.saved.pot.paid[player]
                 && self.saved.pot.phase == Phase::Funding
+                && !self.saved.hashes[player].is_empty()
+                && poll_entries
             {
                 match self
                     .wallet
@@ -662,7 +1026,16 @@ impl Demo {
                     .await?
                 {
                     InvoiceState::Paid { amount_sats } => {
-                        // Account for money already received even if a receiver check expired.
+                        // Account for received money before any verification or amount gate.
+                        if amount_sats != self.saved.pot.entry_sats
+                            || (!self.saved.invoice_addresses[player].is_empty()
+                                && self.saved.invoice_addresses[player]
+                                    != self.saved.addresses[player])
+                        {
+                            self.retire_entry(player, Some(amount_sats));
+                            self.save()?;
+                            continue;
+                        }
                         self.saved.pot.confirm_entry(player, amount_sats)?;
                         self.event(format!(
                             "Player {} Invoice Paid — {} sats",
@@ -673,12 +1046,7 @@ impl Demo {
                     }
                     InvoiceState::Pending => (),
                     InvoiceState::Expired => {
-                        let invoice = self
-                            .wallet
-                            .create_invoice(self.saved.pot.entry_sats, &self.saved.pot.id, 600)
-                            .await?;
-                        self.saved.invoices[player] = invoice.bolt11;
-                        self.saved.hashes[player] = invoice.payment_hash;
+                        self.retire_entry(player, None);
                         self.save()?;
                     }
                 }
@@ -782,6 +1150,8 @@ impl Demo {
                 }
             }
         }
+        self.reconcile_retired().await?;
+        self.ensure_entry_invoices().await?;
         if self.saved.pot.phase == Phase::Settled {
             if let Some(roster) = self.saved.next_roster.clone() {
                 self.next_match(Some(roster)).await?;
@@ -792,12 +1162,21 @@ impl Demo {
     fn view(&self) -> Result<LocalView> {
         let pot = &self.saved.pot;
         let mut view = LocalView {
-            phase: match pot.phase {
-                Phase::Funding => 1,
-                Phase::Ready => 2,
-                Phase::Playing => 3,
-                Phase::Settling => 6,
-                Phase::Settled => 4,
+            phase: if self
+                .saved
+                .retired_entries
+                .iter()
+                .any(|entry| entry.received_sats.is_some() && entry.state != PayoutState::Paid)
+            {
+                6
+            } else {
+                match pot.phase {
+                    Phase::Funding => 1,
+                    Phase::Ready => 2,
+                    Phase::Playing => 3,
+                    Phase::Settling => 6,
+                    Phase::Settled => 4,
+                }
             },
             busy: 0,
             simulated: u32::from(self.simulation.is_some()),
@@ -934,19 +1313,34 @@ pub struct LocalHandle {
 /// `folder` is a valid NUL-terminated UTF-8 path, alive for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_local_create(folder: *const c_char) -> *mut LocalHandle {
+    unsafe { arena_local_create_configured(folder, folder) }
+}
+
+/// # Safety
+/// Both folders are valid NUL-terminated UTF-8 paths. Wallet configuration is
+/// consumed by the background worker, so no wallet work blocks the GUI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_local_create_configured(
+    folder: *const c_char,
+    live_folder: *const c_char,
+) -> *mut LocalHandle {
     ffi_guard(|| {
-        if folder.is_null() {
+        if folder.is_null() || live_folder.is_null() {
             return std::ptr::null_mut();
         }
         let Ok(folder) = (unsafe { CStr::from_ptr(folder) }).to_str() else {
             return std::ptr::null_mut();
         };
+        let Ok(live_folder) = (unsafe { CStr::from_ptr(live_folder) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        let live_folder = PathBuf::from(live_folder);
         let folder = PathBuf::from(folder);
         let shared = Arc::new(Mutex::new(LocalView::default()));
         let target = shared.clone();
         let (sender, receiver) = mpsc::sync_channel(16);
         let worker = std::thread::Builder::new()
-            .name("arena-local-fake".into())
+            .name("arena-local-wallet".into())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -961,10 +1355,20 @@ pub unsafe extern "C" fn arena_local_create(folder: *const c_char) -> *mut Local
                         return;
                     }
                 };
-                let mut demo = match runtime.block_on(Demo::open(&folder)) {
+                // Unit tests inject fake wallets; production reads the main-process
+                // handoff or an explicit development environment override.
+                #[cfg(test)]
+                let wallet_config: Result<config::WalletConfig> = Ok(config::WalletConfig::Fake);
+                #[cfg(not(test))]
+                let wallet_config = config::load();
+                let selected_live = matches!(&wallet_config, Ok(config::WalletConfig::Nwc(_)));
+                let opening =
+                    async { Demo::open_configured(&folder, &live_folder, wallet_config?).await };
+                let mut demo = match runtime.block_on(opening) {
                     Ok(value) => value,
                     Err(error) => {
                         let mut view = target.lock().unwrap();
+                        view.simulated = u32::from(!selected_live);
                         view.phase = 7;
                         view.busy = 0;
                         text(&mut view.error, &error.to_string());
@@ -1352,7 +1756,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
         let initial = host.wait(|v| v.busy == 0);
-        assert!(initial.invoices.iter().all(|v| v[0] != 0));
+        assert!(initial.invoices[..2].iter().all(|v| v[0] != 0));
         assert_ne!(initial.invoices[0], initial.invoices[1]);
         host.fund();
         let live = host.credit([0, 800]);
@@ -1594,3 +1998,6 @@ mod tests {
 
 #[cfg(test)]
 mod four_player_tests;
+
+#[cfg(test)]
+mod retired_tests;

@@ -4,12 +4,14 @@
 mod address;
 mod fake;
 mod lnurl;
+mod nwc;
 pub use address::{AddressInvoices, LightningAddress, PreparedPayout, prepare_payout};
 pub use lnurl::{AddressVerification, AddressVerifier, LnurlClient, VERIFICATION_TTL_MS};
 
 use async_trait::async_trait;
 
 pub use fake::{FakeAddressInvoices, FakeWallet};
+pub use nwc::{NWC_WALLET_MANAGED_FEES, NwcWallet};
 
 pub struct NewInvoice {
     pub bolt11: String,

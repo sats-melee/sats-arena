@@ -10,11 +10,14 @@ in five-second batches. At match end, winners recover their own unspent funds
 and split all losing sides' remaining pots evenly among winning humans.
 Winnings never substitute for the next match's entry.
 
-**The embedded host currently simulates both incoming and outgoing payments.**
-Receiving addresses now receive live LNURL/BOLT11 verification in the sidebar.
-The real receiving-invoice resolver is implemented; the NWC funding/payout wallet
-adapter remains to be connected. [Verification details](docs/address-verification.md).
-See [batch timing and adapter contracts](docs/batched-payouts.md).
+**The embedded host supports simulated payments and Nostr Wallet Connect.**
+Production local play uses the launcher's saved wallet setting and protected
+connection store. A private stdin handoff supplies native Dolphin; the saved
+credential stays out of arguments, child environment and settings files.
+`SATS_ARENA_NWC_URI` is an explicit developer override. See
+[NWC setup and recovery](docs/nwc-local-wallet.md),
+[address verification](docs/address-verification.md), and
+[batch contracts](docs/batched-payouts.md).
 
 The older account/balance engine and HTTP server remain available as a separate
 prototype; their APIs below do not define the new match-sidebar UX.
@@ -25,7 +28,7 @@ prototype; their APIs below do not define the new match-sidebar UX.
 - `core/`: the four-slot prepaid `arena_pot::MatchPot` rules, plus the older engine, SQLite ledger, settlement, and wallet interface. No HTTP
   listener, Electron, or dependency on a specific node installation.
 - `server/`: a thin HTTP wrapper and host configuration for that same engine.
-- `local/`: fake-only C ABI host for Dolphin, with its own background worker.
+- `local/`: fake/NWC C ABI host for Dolphin, with its own background worker.
   No local listener or server process. `local/include/sats_arena_local.h` is
   the C++ boundary; the payment rules still live only in `core/`.
 
@@ -44,12 +47,12 @@ The native Dolphin build embeds the prepaid host in its scrollable sidebar.
 Melee boots immediately. Each active human has an address checked automatically at PRESS START,
 entry QR, funding status and pot. Start stays blocked until every human is
 verified and paid. Finalized, sequenced attacker/victim credits trigger batched
-simulated payouts; an authoritative team result drives settlement. Changing a
+payouts through the selected wallet; an authoritative team result drives settlement. Changing a
 funded roster returns entries before issuing new invoices. See
 `Ishiiruka/docs/LocalFundingPreview.md`.
 
-**Not wired yet:** launcher Local/Remote mode selection and the real NWC wallet
-adapter. The launcher's current Host button still starts the server preview.
+Use **Play local Arena** for embedded local play. The separate Host/Connect
+server controls remain an older remote balance preview.
 
 ## Older remote balance prototype
 
@@ -60,8 +63,8 @@ cargo run --release -p sats-arena-server -- sats-arena.toml
 
 The server preview explicitly uses an automatically paid fake wallet. The
 engine's default test wallet instead starts invoices unpaid, so confirmation
-and expiry can be tested. NWC support is next; its config is accepted, but the
-server refuses to start that backend rather than pretending to make payments.
+and expiry can be tested. This older server still refuses its NWC configuration;
+real NWC execution is connected to the native local-match host.
 
 ## Older balance-engine payment flow
 

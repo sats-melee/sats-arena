@@ -30,9 +30,11 @@ typedef struct ArenaLocalView {
  * 11/12 winner P3/P4 (winner identifies whole side in teams).
  * credit(): cumulative finalized attributed damage received by P1/P2, centi-percent.
  * Duplicate counters are safe. New match resets counters to zero.
- * Simulated incoming/outgoing wallet; live receiving-address verification.
+ * Fake/NWC incoming and outgoing wallets; live receiving-address verification.
  */
 ArenaLocalHandle* arena_local_create(const char* folder);
+/* Separate fake/live roots; live state is additionally bound to wallet identity. */
+ArenaLocalHandle* arena_local_create_configured(const char* fake_folder, const char* live_folder);
 bool arena_local_snapshot(const ArenaLocalHandle*, ArenaLocalView* out);
 bool arena_local_action(const ArenaLocalHandle*, uint32_t action);
 bool arena_local_credit(const ArenaLocalHandle*, uint64_t p1_damage_centi, uint64_t p2_damage_centi);

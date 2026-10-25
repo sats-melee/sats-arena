@@ -3,3 +3,8 @@ sats-arena.toml
 *.db
 *.db-shm
 *.db-wal
+
+# Developer credentials must never be committed.
+.env
+.env.*
+!.env.example
