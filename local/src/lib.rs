@@ -4,8 +4,8 @@ use sats_arena_core::{
     Error, Result,
     pot::{MatchPot, PayoutState, Phase},
     wallet::{
-        AddressInvoices, FakeAddressInvoices, FakeWallet, InvoiceState, LightningAddress,
-        PaymentState, PreparedPayout, Wallet, prepare_payout,
+        AddressInvoices, AddressVerification, AddressVerifier, FakeAddressInvoices, FakeWallet,
+        InvoiceState, LightningAddress, PaymentState, PreparedPayout, Wallet, prepare_payout,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -40,11 +40,16 @@ pub struct LocalView {
     pub addresses: [[u8; 128]; 2],
     pub batch_remaining_ms: [u64; 2],
     pub payment_log: [u8; 4096],
+    pub verification_state: [u32; 2],
+    pub min_sendable_msat: [u64; 2],
+    pub max_sendable_msat: [u64; 2],
+    pub verification_message: [[u8; 256]; 2],
+    pub verification_checked_ms: [u64; 2],
 }
 impl Default for LocalView {
     fn default() -> Self {
         Self {
-            abi_version: 3,
+            abi_version: 4,
             phase: 0,
             busy: 1,
             simulated: 1,
@@ -60,6 +65,11 @@ impl Default for LocalView {
             addresses: [[0; 128]; 2],
             batch_remaining_ms: [0; 2],
             payment_log: [0; 4096],
+            verification_state: [0; 2],
+            min_sendable_msat: [0; 2],
+            max_sendable_msat: [0; 2],
+            verification_message: [[0; 256]; 2],
+            verification_checked_ms: [0; 2],
         }
     }
 }
@@ -88,6 +98,13 @@ struct Saved {
     max_fee_sats: u64,
     #[serde(default = "default_simulated")]
     simulated: bool,
+    #[serde(default)]
+    verification: [AddressCheck; 2],
+}
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct AddressCheck {
+    report: Option<AddressVerification>,
+    error: String,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct Receipt {
@@ -101,6 +118,7 @@ struct Receipt {
 struct Demo {
     wallet: Arc<dyn Wallet>,
     provider: Arc<dyn AddressInvoices>,
+    verifier: Arc<dyn AddressVerifier>,
     simulation: Option<Arc<FakeWallet>>,
     saved: Saved,
     path: PathBuf,
@@ -139,6 +157,7 @@ impl Demo {
             used_payment_hashes: BTreeSet::new(),
             receipts: vec![],
             simulated,
+            verification: Default::default(),
             max_fee_sats: setting("SATS_ARENA_MAX_PAYOUT_FEE_SATS", default_fee_limit())?,
         })
     }
@@ -150,6 +169,7 @@ impl Demo {
             fake.clone(),
             Arc::new(FakeAddressInvoices),
             Some(fake),
+            default_verifier(),
         )
         .await
     }
@@ -159,6 +179,7 @@ impl Demo {
         wallet: Arc<dyn Wallet>,
         provider: Arc<dyn AddressInvoices>,
         simulation: Option<Arc<FakeWallet>>,
+        verifier: Arc<dyn AddressVerifier>,
     ) -> Result<Self> {
         let path = folder.join("prepaid-match.json");
         let mut saved: Saved = if path.exists() {
@@ -215,6 +236,7 @@ impl Demo {
         let demo = Self {
             wallet,
             provider,
+            verifier,
             simulation,
             saved,
             path,
@@ -253,16 +275,47 @@ impl Demo {
         match command {
             Command::Credit(totals) => self.saved.pot.credit_at(totals, now_ms())?,
             Command::Addresses(addresses) => {
-                if self.saved.pot.phase != Phase::Funding
-                    || self.saved.pot.paid.iter().any(|paid| *paid)
+                let first = parse_address(&addresses[0])?;
+                let second = parse_address(&addresses[1])?;
+                let canonical = [first.as_str().into(), second.as_str().into()];
+                if !matches!(self.saved.pot.phase, Phase::Funding | Phase::Ready)
+                    || (self.saved.pot.paid.iter().any(|paid| *paid)
+                        && canonical != self.saved.addresses)
                 {
                     return Err(Error::Rejected(
                         "payout addresses are locked after entry payment".into(),
                     ));
                 }
-                let first = parse_address(&addresses[0])?;
-                let second = parse_address(&addresses[1])?;
-                self.saved.addresses = [first.as_str().into(), second.as_str().into()];
+                self.saved.addresses = canonical;
+                self.saved.verification = Default::default();
+                self.save()?; // Never leave old verification attached to edited addresses.
+                let verifier = self.verifier.clone();
+                let check = |address: LightningAddress| {
+                    let verifier = verifier.clone();
+                    async move {
+                        match tokio::time::timeout(
+                            Duration::from_secs(20),
+                            verifier.verify(&address),
+                        )
+                        .await
+                        {
+                            Ok(Ok(report)) => AddressCheck {
+                                report: Some(report),
+                                error: String::new(),
+                            },
+                            Ok(Err(error)) => AddressCheck {
+                                report: None,
+                                error: format!("{error:#}"),
+                            },
+                            Err(_) => AddressCheck {
+                                report: None,
+                                error: "Address verification timed out; try again".into(),
+                            },
+                        }
+                    }
+                };
+                let (first, second) = tokio::join!(check(first), check(second));
+                self.saved.verification = [first, second];
             }
             Command::Action(action) => match action {
                 1 => {
@@ -278,6 +331,7 @@ impl Demo {
                     let mut next =
                         Self::fresh(self.wallet.as_ref(), self.simulation.is_some()).await?;
                     next.addresses = self.saved.addresses.clone();
+                    next.verification = self.saved.verification.clone();
                     next.receipts = self.saved.receipts.clone();
                     next.used_payment_hashes = self.saved.used_payment_hashes.clone();
                     self.saved = next;
@@ -313,8 +367,26 @@ impl Demo {
         Ok(())
     }
     fn require_addresses(&self) -> Result<()> {
-        for address in &self.saved.addresses {
+        for (player, address) in self.saved.addresses.iter().enumerate() {
             parse_address(address)?;
+            let report = self.saved.verification[player]
+                .report
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Rejected(format!(
+                        "Verify Player {} receiving address first",
+                        player + 1
+                    ))
+                })?;
+            if report.address != *address
+                || !report.fresh(now_ms())
+                || !report.supports_match(self.saved.pot.entry_sats)
+            {
+                return Err(Error::Rejected(format!(
+                    "Player {} needs current, compatible address verification",
+                    player + 1
+                )));
+            }
         }
         Ok(())
     }
@@ -469,6 +541,31 @@ impl Demo {
         for i in 0..2 {
             text(&mut view.invoices[i], &self.saved.invoices[i]);
             text(&mut view.addresses[i], &self.saved.addresses[i]);
+            let check = &self.saved.verification[i];
+            if let Some(report) = &check.report {
+                view.min_sendable_msat[i] = report.min_msat;
+                view.max_sendable_msat[i] = report.max_msat;
+                view.verification_checked_ms[i] = report.checked_at_ms;
+                view.verification_state[i] = if report.address != self.saved.addresses[i] {
+                    0
+                } else if !report.fresh(now_ms()) {
+                    4
+                } else if !report.supports_match(pot.entry_sats) {
+                    5
+                } else {
+                    2
+                };
+                let message = match view.verification_state[i] {
+                    2 => "Receiver and unpaid invoice checked; no payment sent",
+                    4 => "Verification expired; verify again before funding",
+                    5 => "Receiver limits do not cover 1-sat batches and this match pot",
+                    _ => "Verify this receiving address",
+                };
+                text(&mut view.verification_message[i], message);
+            } else if !check.error.is_empty() {
+                view.verification_state[i] = 3;
+                text(&mut view.verification_message[i], &check.error);
+            }
             view.batch_remaining_ms[i] = pot.batch_deadline_ms[i]
                 .map(|d| d.saturating_sub(now_ms()))
                 .unwrap_or(0);
@@ -494,6 +591,37 @@ impl Demo {
         }
         text(&mut view.payment_log, &log);
         Ok(view)
+    }
+}
+#[cfg(not(test))]
+fn default_verifier() -> Arc<dyn AddressVerifier> {
+    Arc::new(sats_arena_core::wallet::LnurlClient)
+}
+#[cfg(test)]
+fn default_verifier() -> Arc<dyn AddressVerifier> {
+    Arc::new(TestVerifier)
+}
+#[cfg(test)]
+struct TestVerifier;
+#[cfg(test)]
+#[async_trait::async_trait]
+impl AddressVerifier for TestVerifier {
+    async fn verify(&self, address: &LightningAddress) -> anyhow::Result<AddressVerification> {
+        anyhow::ensure!(
+            !address.as_str().starts_with("missing@"),
+            "receiving address does not exist"
+        );
+        Ok(AddressVerification {
+            address: address.as_str().into(),
+            min_msat: 1000,
+            max_msat: 1_000_000_000,
+            callback_host: "fixture.invalid".into(),
+            checked_at_ms: now_ms(),
+            test_invoice_msat: 1000,
+            description_binding: "test_fixture".into(),
+            test_payment_hash: "fixture-unpaid".into(),
+            invoice_expires_at_ms: now_ms() + 600_000,
+        })
     }
 }
 fn parse_address(input: &str) -> Result<LightningAddress> {
@@ -822,7 +950,7 @@ mod tests {
 
     #[test]
     fn two_fresh_invoices_live_outgoing_payout_then_winner_pot_and_new_invoices() {
-        assert_eq!(std::mem::size_of::<LocalView>(), 8824);
+        assert_eq!(std::mem::size_of::<LocalView>(), 9392);
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
         let initial = host.wait(|v| v.busy == 0);
@@ -969,6 +1097,46 @@ mod tests {
         assert_eq!(saved.receipts.len(), 1);
         assert_eq!(saved.receipts[0].address, "alice@example.test");
         assert_eq!(saved.receipts[0].sats, 1000);
+    }
+
+    #[test]
+    fn failed_stale_and_incompatible_verification_block_funding() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut demo = Demo::open(dir.path()).await.unwrap();
+            demo.command(Command::Addresses([
+                "missing@example.test".into(),
+                "bob@example.test".into(),
+            ]))
+            .await
+            .unwrap();
+            assert_eq!(demo.view().unwrap().verification_state, [3, 2]);
+            assert!(demo.command(Command::Action(2)).await.is_err());
+            demo.command(Command::Addresses([
+                "alice@example.test".into(),
+                "bob@example.test".into(),
+            ]))
+            .await
+            .unwrap();
+            assert_eq!(demo.view().unwrap().verification_state, [2, 2]);
+            demo.saved.verification[0]
+                .report
+                .as_mut()
+                .unwrap()
+                .checked_at_ms = now_ms() - sats_arena_core::wallet::VERIFICATION_TTL_MS;
+            assert_eq!(demo.view().unwrap().verification_state[0], 4);
+            assert!(demo.command(Command::Action(2)).await.is_err());
+            let report = demo.saved.verification[0].report.as_mut().unwrap();
+            report.checked_at_ms = now_ms();
+            report.min_msat = 2000;
+            assert_eq!(demo.view().unwrap().verification_state[0], 5);
+            assert!(demo.command(Command::Action(2)).await.is_err());
+            assert_eq!(demo.saved.pot.paid, [false, false]);
+        });
     }
 
     #[test]

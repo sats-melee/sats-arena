@@ -59,7 +59,10 @@ A production address provider implements [LUD-16](https://github.com/lnurl/luds/
 and [LUD-06](https://github.com/lnurl/luds/blob/luds/06.md): HTTPS discovery,
 callback invoice request in millisats, advertised bounds, metadata binding,
 expiry, and protocol error handling. It must not make the payment itself.
-The current FakeAddressInvoices never contacts the entered domain.
+The current fake payout provider never contacts the entered domain. The real
+`LnurlClient` now implements receiving discovery, invoice validation and the
+separate live `AddressVerifier` used by the GUI. See
+[address verification](address-verification.md).
 
 An NWC wallet adapter maps the wallet operations to make_invoice,
 lookup_invoice and pay_invoice as supported by the connected wallet, and uses

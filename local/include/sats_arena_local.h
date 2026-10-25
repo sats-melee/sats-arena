@@ -15,8 +15,12 @@ typedef struct ArenaLocalView {
     char addresses[2][128];
     uint64_t batch_remaining_ms[2];
     char payment_log[4096];
+    uint32_t verification_state[2];
+    uint64_t min_sendable_msat[2], max_sendable_msat[2];
+    char verification_message[2][256];
+    uint64_t verification_checked_ms[2];
 } ArenaLocalView;
-/* ABI 3. Two fresh entry invoices every match. No reusable account balance.
+/* ABI 4. Two fresh entry invoices every match. No reusable account balance.
  * Phase: 0 loading, 1 awaiting entry, 2 paid, 3 playing, 4 paid out,
  * 6 payouts pending, 7 error.
  * Actions: 1 next match, 2/3 simulate entry payment P1/P2, 4 start,

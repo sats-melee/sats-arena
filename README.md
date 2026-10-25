@@ -9,8 +9,9 @@ There are no reusable player balances, budget reservations or fixed win bonus
 in this flow. The next match always requires two new payments.
 
 **The embedded host currently simulates both incoming and outgoing payments.**
-Receiving-address inputs and a confirmed-payment log are implemented; real wallet
-and Lightning Address network adapters remain to be connected.
+Receiving addresses now receive live LNURL/BOLT11 verification in the sidebar.
+The real receiving-invoice resolver is implemented; the NWC funding/payout wallet
+adapter remains to be connected. [Verification details](docs/address-verification.md).
 See [batch timing and adapter contracts](docs/batched-payouts.md).
 
 The older account/balance engine and HTTP server remain available as a separate
