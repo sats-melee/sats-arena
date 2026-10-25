@@ -21,11 +21,12 @@ typedef struct ArenaLocalView {
     uint64_t verification_checked_ms[4];
     uint32_t teams, kinds[4], team_ids[4], characters[4], roster_configured;
     uint64_t last_credit_sequence;
+    uint32_t sandbox;
 } ArenaLocalView;
-/* ABI 5. Fresh entry invoices for every participating human. No reusable account balance.
+/* ABI 6. Fresh entry invoices for every participating human. No reusable account balance.
  * Phase: 0 loading, 1 awaiting entry, 2 paid, 3 playing, 4 paid out,
  * 6 payouts pending, 7 error.
- * Actions: 1 next match, 2/3 simulate entry payment P1/P2, 4 start,
+ * Actions: 1 next match, 2/3 pay sandbox entry (or simulate in unit-test fake mode) P1/P2, 4 start,
  * 5 cancel, 6/7 winner P1/P2, 8 no contest, 9/10 fund P3/P4,
  * 11/12 winner P3/P4 (winner identifies whole side in teams).
  * credit(): cumulative finalized attributed damage received by P1/P2, centi-percent.

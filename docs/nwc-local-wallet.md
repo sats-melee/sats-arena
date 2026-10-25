@@ -1,5 +1,22 @@
 # Native local wallet: launcher first, environment for development
 
+## Sandbox development
+
+Use `make sandbox` in the adjacent launcher/workspace. It provisions five
+reusable Alby NWC test wallets, prefills the four player receiving addresses,
+and keeps Sandbox state separate from live funds. The native Sandbox uses the
+same invoice creation, incoming confirmation, damage batching and payout logic
+as live NWC. Its **Pay from test wallet** button sends a real NWC request from
+the corresponding sandbox wallet; it never marks an invoice paid locally.
+Only the internal unit-test fake wallet has a simulated-payment action.
+
+The launcher sends `backend: "sandbox"`, the Arena NWC URI, and four
+`sandbox_players` (each `nwc_uri` and `address`) over the private stdin pipe.
+Credentials are not persisted in match state or exposed to the renderer.
+Sandbox receiving addresses stay bound to these test wallets. Its ledgers live
+under `<Dolphin user>/SatsArenaSandbox/<public-wallet-fingerprint>/`.
+See `slippi-launcher/docs/sandbox.md` for agent-friendly setup and test commands.
+
 ## Configure and launch
 
 In the launcher, choose **Wallet → Nostr Wallet Connect**, save the connection,

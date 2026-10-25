@@ -54,11 +54,12 @@ pub struct LocalView {
     pub characters: [u32; 4],
     pub roster_configured: u32,
     pub last_credit_sequence: u64,
+    pub sandbox: u32,
 }
 impl Default for LocalView {
     fn default() -> Self {
         Self {
-            abi_version: 5,
+            abi_version: 6,
             phase: 0,
             busy: 1,
             simulated: 1,
@@ -85,6 +86,7 @@ impl Default for LocalView {
             characters: [255; 4],
             roster_configured: 0,
             last_credit_sequence: 0,
+            sandbox: 0,
         }
     }
 }
@@ -186,6 +188,7 @@ struct Demo {
     provider: Arc<dyn AddressInvoices>,
     verifier: Arc<dyn AddressVerifier>,
     simulation: Option<Arc<FakeWallet>>,
+    sandbox_players: Option<[config::SandboxPlayer; 4]>,
     saved: Saved,
     path: PathBuf,
     retired_cursor: usize,
@@ -269,62 +272,83 @@ impl Demo {
         live_folder: &Path,
         config: config::WalletConfig,
     ) -> Result<Self> {
-        match config {
-            config::WalletConfig::Fake => Self::open(fake_folder).await,
-            config::WalletConfig::Nwc(uri) => {
-                use sats_arena_core::wallet::{LnurlClient, NWC_WALLET_MANAGED_FEES, NwcWallet};
-                if std::env::var("SATS_ARENA_MAX_PAYOUT_FEE_SATS")
-                    .ok()
-                    .is_some_and(|v| v.parse::<u64>().ok() != Some(NWC_WALLET_MANAGED_FEES))
-                {
-                    return Err(Error::Rejected("NWC fees are controlled by the wallet connection; remove the unsupported app fee cap".into()));
-                }
-                let wallet =
-                    tokio::time::timeout(Duration::from_secs(30), NwcWallet::connect(uri.expose()))
-                        .await
-                        .map_err(|_| {
-                            Error::Rejected(
-                                "NWC connection timed out; check the launcher wallet and relay"
-                                    .into(),
-                            )
-                        })?
-                        .map_err(|error| Error::Rejected(format!("NWC wallet: {error}")))?;
-                let identity = wallet.identity();
-                if identity.is_empty() || !identity.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(Error::Rejected("Invalid NWC wallet identity".into()));
-                }
-                let folder = live_folder.join(&identity);
-                std::fs::create_dir_all(&folder).map_err(|e| Error::Internal(e.into()))?;
-                let mut demo = Self::open_with(
-                    &folder,
-                    Arc::new(wallet),
-                    Arc::new(LnurlClient),
-                    None,
-                    default_verifier(),
-                )
-                .await?;
-                if demo
-                    .saved
-                    .wallet_identity
-                    .as_ref()
-                    .is_some_and(|old| old != &identity)
-                {
-                    return Err(Error::Rejected(
-                        "Stored match belongs to a different wallet connection".into(),
-                    ));
-                }
-                if demo.saved.wallet_identity.is_none()
-                    && (demo.saved.pot.paid.iter().any(|p| *p) || !demo.saved.prepared.is_empty())
-                {
-                    return Err(Error::Rejected(
-                        "Funded live state is missing its wallet identity".into(),
-                    ));
-                }
-                demo.saved.wallet_identity = Some(identity);
-                demo.saved.max_fee_sats = NWC_WALLET_MANAGED_FEES;
-                demo.save()?;
-                Ok(demo)
+        let (uri, sandbox_players) = match config {
+            config::WalletConfig::Fake => return Self::open(fake_folder).await,
+            config::WalletConfig::Nwc(uri) => (uri, None),
+            config::WalletConfig::Sandbox(uri, players) => (uri, Some(players)),
+        };
+        {
+            use sats_arena_core::wallet::{LnurlClient, NWC_WALLET_MANAGED_FEES, NwcWallet};
+            if std::env::var("SATS_ARENA_MAX_PAYOUT_FEE_SATS")
+                .ok()
+                .is_some_and(|v| v.parse::<u64>().ok() != Some(NWC_WALLET_MANAGED_FEES))
+            {
+                return Err(Error::Rejected("NWC fees are controlled by the wallet connection; remove the unsupported app fee cap".into()));
             }
+            let wallet =
+                tokio::time::timeout(Duration::from_secs(30), NwcWallet::connect(uri.expose()))
+                    .await
+                    .map_err(|_| {
+                        Error::Rejected(
+                            "NWC connection timed out; check the launcher wallet and relay".into(),
+                        )
+                    })?
+                    .map_err(|error| Error::Rejected(format!("NWC wallet: {error}")))?;
+            let identity = wallet.identity();
+            if identity.is_empty() || !identity.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(Error::Rejected("Invalid NWC wallet identity".into()));
+            }
+            let root = if sandbox_players.is_some() {
+                live_folder
+                    .parent()
+                    .unwrap_or(live_folder)
+                    .join("SatsArenaSandbox")
+            } else {
+                live_folder.to_path_buf()
+            };
+            let folder = root.join(&identity);
+            std::fs::create_dir_all(&folder).map_err(|e| Error::Internal(e.into()))?;
+            let mut demo = Self::open_with(
+                &folder,
+                Arc::new(wallet),
+                Arc::new(LnurlClient),
+                None,
+                default_verifier(),
+            )
+            .await?;
+            if demo
+                .saved
+                .wallet_identity
+                .as_ref()
+                .is_some_and(|old| old != &identity)
+            {
+                return Err(Error::Rejected(
+                    "Stored match belongs to a different wallet connection".into(),
+                ));
+            }
+            if demo.saved.wallet_identity.is_none()
+                && (demo.saved.pot.paid.iter().any(|p| *p) || !demo.saved.prepared.is_empty())
+            {
+                return Err(Error::Rejected(
+                    "Funded live state is missing its wallet identity".into(),
+                ));
+            }
+            if let Some(players) = &sandbox_players {
+                for (i, player) in players.iter().enumerate() {
+                    if demo.saved.addresses[i].is_empty() {
+                        demo.saved.addresses[i] = player.address.clone();
+                    } else if demo.saved.addresses[i] != player.address {
+                        return Err(Error::Rejected(
+                            "Sandbox fixture changed; preserve the previous wallet state".into(),
+                        ));
+                    }
+                }
+            }
+            demo.sandbox_players = sandbox_players;
+            demo.saved.wallet_identity = Some(identity);
+            demo.saved.max_fee_sats = NWC_WALLET_MANAGED_FEES;
+            demo.save()?;
+            Ok(demo)
         }
     }
     // No NWC/LND-specific behavior below this boundary.
@@ -469,6 +493,7 @@ impl Demo {
             provider,
             verifier,
             simulation,
+            sandbox_players: None,
             saved,
             path,
             retired_cursor: 0,
@@ -599,6 +624,15 @@ impl Demo {
                     return Err(Error::Rejected("invalid player".into()));
                 }
                 let address = parse_address(&value)?;
+                if self
+                    .sandbox_players
+                    .as_ref()
+                    .is_some_and(|players| address.as_str() != players[player].address)
+                {
+                    return Err(Error::Rejected(
+                        "Sandbox uses the prefilled player test addresses".into(),
+                    ));
+                }
                 if !matches!(self.saved.pot.phase, Phase::Funding | Phase::Ready)
                     || (self.saved.pot.paid.iter().any(|paid| *paid)
                         && address.as_str() != self.saved.addresses[player])
@@ -706,15 +740,36 @@ impl Demo {
                     if self.saved.pot.kinds[player] != 0 {
                         return Err(Error::Rejected("only humans fund entries".into()));
                     }
-                    self.simulation
-                        .as_ref()
-                        .ok_or_else(|| Error::Rejected("simulation is disabled".into()))?
-                        .set_invoice_state(
-                            &self.saved.hashes[player],
-                            InvoiceState::Paid {
-                                amount_sats: self.saved.pot.entry_sats,
-                            },
-                        );
+                    if let Some(players) = &self.sandbox_players {
+                        use sats_arena_core::wallet::{NWC_WALLET_MANAGED_FEES, NwcWallet};
+                        let invoice = &self.saved.invoices[player];
+                        if invoice.is_empty() {
+                            return Err(Error::Rejected("Wait for the entry invoice".into()));
+                        }
+                        let payer = NwcWallet::connect(players[player].uri.expose())
+                            .await
+                            .map_err(Error::Internal)?;
+                        let payment = payer.pay_invoice(invoice, NWC_WALLET_MANAGED_FEES).await;
+                        payer.shutdown().await;
+                        match payment.map_err(Error::Internal)? {
+                            PaymentState::Failed { reason } => return Err(Error::Rejected(reason)),
+                            _ => self.event(format!(
+                                "Sandbox Player {} • entry payment sent",
+                                player + 1
+                            )),
+                        }
+                        // Admission only follows the arena wallet's normal incoming receipt lookup.
+                    } else {
+                        self.simulation
+                            .as_ref()
+                            .ok_or_else(|| Error::Rejected("simulation is disabled".into()))?
+                            .set_invoice_state(
+                                &self.saved.hashes[player],
+                                InvoiceState::Paid {
+                                    amount_sats: self.saved.pot.entry_sats,
+                                },
+                            );
+                    }
                 }
                 4 => {
                     self.require_addresses()?;
@@ -1180,6 +1235,7 @@ impl Demo {
             },
             busy: 0,
             simulated: u32::from(self.simulation.is_some()),
+            sandbox: u32::from(self.sandbox_players.is_some()),
             entry_sats: pot.entry_sats,
             sats_per_percent: pot.sats_per_percent,
             paid_sats: pot.paid.map(|paid| if paid { pot.entry_sats } else { 0 }),
@@ -1361,7 +1417,12 @@ pub unsafe extern "C" fn arena_local_create_configured(
                 let wallet_config: Result<config::WalletConfig> = Ok(config::WalletConfig::Fake);
                 #[cfg(not(test))]
                 let wallet_config = config::load();
-                let selected_live = matches!(&wallet_config, Ok(config::WalletConfig::Nwc(_)));
+                let selected_live = matches!(
+                    &wallet_config,
+                    Ok(config::WalletConfig::Nwc(_) | config::WalletConfig::Sandbox(_, _))
+                );
+                let selected_sandbox =
+                    matches!(&wallet_config, Ok(config::WalletConfig::Sandbox(_, _)));
                 let opening =
                     async { Demo::open_configured(&folder, &live_folder, wallet_config?).await };
                 let mut demo = match runtime.block_on(opening) {
@@ -1369,6 +1430,7 @@ pub unsafe extern "C" fn arena_local_create_configured(
                     Err(error) => {
                         let mut view = target.lock().unwrap();
                         view.simulated = u32::from(!selected_live);
+                        view.sandbox = u32::from(selected_sandbox);
                         view.phase = 7;
                         view.busy = 0;
                         text(&mut view.error, &error.to_string());
@@ -1752,7 +1814,7 @@ mod tests {
 
     #[test]
     fn two_fresh_invoices_live_outgoing_payout_then_winner_pot_and_new_invoices() {
-        assert_eq!(std::mem::size_of::<LocalView>(), 14456);
+        assert_eq!(std::mem::size_of::<LocalView>(), 14464);
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
         let initial = host.wait(|v| v.busy == 0);

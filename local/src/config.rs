@@ -25,6 +25,18 @@ impl fmt::Debug for Secret {
 pub(crate) enum WalletConfig {
     Fake,
     Nwc(Secret),
+    Sandbox(Secret, [SandboxPlayer; 4]),
+}
+#[derive(Debug)]
+pub(crate) struct SandboxPlayer {
+    pub(crate) uri: Secret,
+    pub(crate) address: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LauncherPlayer {
+    nwc_uri: String,
+    address: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,14 +45,16 @@ struct LauncherConfig {
     backend: String,
     #[serde(default)]
     nwc_uri: Option<String>,
+    #[serde(default)]
+    sandbox_players: Option<[LauncherPlayer; 4]>,
 }
 fn rejected(message: &str) -> Error {
     Error::Rejected(message.into())
 }
 fn backend(value: &str) -> Result<&str> {
     match value {
-        "fake" | "nwc" => Ok(value),
-        _ => Err(rejected("Wallet backend must be fake or nwc")),
+        "fake" | "nwc" | "sandbox" => Ok(value),
+        _ => Err(rejected("Wallet backend must be fake or nwc or sandbox")),
     }
 }
 fn parse_launcher(bytes: &[u8]) -> Result<LauncherConfig> {
@@ -60,6 +74,11 @@ fn parse_launcher(bytes: &[u8]) -> Result<LauncherConfig> {
             "Fake-wallet configuration cannot include an NWC connection",
         ));
     }
+    if (config.backend == "sandbox") != config.sandbox_players.is_some() {
+        return Err(rejected(
+            "Sandbox requires exactly four isolated player wallets",
+        ));
+    }
     Ok(config)
 }
 fn resolve(
@@ -74,6 +93,15 @@ fn resolve(
             "Conflicting development wallet settings: fake backend and NWC connection",
         ));
     }
+    if dev_uri.is_some()
+        && launcher
+            .as_ref()
+            .is_some_and(|config| config.backend == "sandbox")
+    {
+        return Err(rejected(
+            "Sandbox cannot use a live NWC environment override",
+        ));
+    }
     let selected = explicit.unwrap_or_else(|| {
         if dev_uri.is_some() {
             "nwc"
@@ -86,6 +114,43 @@ fn resolve(
     });
     if selected == "fake" {
         return Ok(WalletConfig::Fake);
+    }
+    if selected == "sandbox" {
+        if dev_uri.is_some() {
+            return Err(rejected(
+                "Sandbox cannot use a live NWC environment override",
+            ));
+        }
+        let config = launcher.ok_or_else(|| rejected("Sandbox requires launcher wallet setup"))?;
+        let uri = config
+            .nwc_uri
+            .ok_or_else(|| rejected("Sandbox arena wallet is missing"))?;
+        let players = config
+            .sandbox_players
+            .ok_or_else(|| rejected("Sandbox player wallets are missing"))?;
+        let mut checked = Vec::new();
+        for player in players {
+            if !player.nwc_uri.starts_with("nostr+walletconnect://")
+                || !player.address.starts_with("nwc")
+                || !player.address.ends_with("@getalby.com")
+                || sats_arena_core::wallet::LightningAddress::parse(&player.address).is_err()
+            {
+                return Err(rejected("Invalid Alby sandbox player wallet"));
+            }
+            checked.push(SandboxPlayer {
+                uri: Secret(player.nwc_uri),
+                address: player.address,
+            });
+        }
+        if !uri.starts_with("nostr+walletconnect://") {
+            return Err(rejected("Invalid sandbox arena wallet"));
+        }
+        return Ok(WalletConfig::Sandbox(
+            Secret(uri),
+            checked
+                .try_into()
+                .map_err(|_| rejected("Invalid sandbox roster"))?,
+        ));
     }
     let uri = dev_uri
         .map(str::to_owned)
@@ -147,6 +212,7 @@ mod tests {
             version: 1,
             backend: backend.into(),
             nwc_uri: uri.map(str::to_owned),
+            sandbox_players: None,
         }
     }
     #[test]
@@ -181,5 +247,32 @@ mod tests {
         assert!(parse_launcher(br#"{"version":1,"backend":"fake","nwc_uri":"secret"}"#).is_err());
         assert!(parse_launcher(&vec![b'x'; MAX_CONFIG_BYTES as usize + 1]).is_err());
         assert!(parse_launcher(b"private malformed data").is_err());
+    }
+    #[test]
+    fn sandbox_requires_four_players_redacts_keys_and_rejects_live_overrides() {
+        let players = (1..=4).map(|n| serde_json::json!({"nwc_uri":format!("nostr+walletconnect://player{n}?secret=private-player-key"),"address":format!("nwc{n}@getalby.com")})).collect::<Vec<_>>();
+        let payload = serde_json::json!({"version":1,"backend":"sandbox","nwc_uri":"nostr+walletconnect://arena?secret=private-arena-key","sandbox_players":players});
+        let config = parse_launcher(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        let resolved = resolve(Some(config), None, None).unwrap();
+        assert!(matches!(&resolved, WalletConfig::Sandbox(_, _)));
+        assert!(!format!("{resolved:?}").contains("private-"));
+        let config = parse_launcher(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert!(resolve(Some(config), None, Some("nostr+walletconnect://live")).is_err());
+        let mut invalid = payload.clone();
+        invalid["sandbox_players"][0]["address"] = serde_json::json!("real@wallet.example");
+        assert!(
+            resolve(
+                Some(parse_launcher(&serde_json::to_vec(&invalid).unwrap()).unwrap()),
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            parse_launcher(br#"{"version":1,"backend":"sandbox","nwc_uri":"private"}"#).is_err()
+        );
+        let mut invalid = payload;
+        invalid["backend"] = serde_json::json!("nwc");
+        assert!(parse_launcher(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 }
