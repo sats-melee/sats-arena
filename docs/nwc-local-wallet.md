@@ -134,6 +134,46 @@ other accounting. Current incoming polling is throttled; retired hashes use a
 bounded rotating scan, so an old QR's refund can take longer than a current entry
 confirmation. Keep the arena host running to process those returns.
 
+## Responsive payment worker and timing diagnostics
+
+The coordinator owns all accounting and durable writes. It runs a continuous
+async runtime, publishes snapshots on a 20 ms tick, and accepts damage credits
+while network jobs are in flight. Up to four payout jobs and four incoming
+invoice/receipt jobs run concurrently. A slow recipient does not serialize the
+other recipients. The configured damage window remains unchanged. Old incoming
+invoice monitoring has a global budget of four requests per two seconds; history
+growth does not multiply the polling rate.
+
+Each payout advances through recipient invoice preparation, durable InFlight,
+wallet submission, and confirmed receipt. Network jobs carry immutable IDs and
+return facts; they never mutate funds. The invoice/hash and InFlight transition
+are saved before submission. Timeouts and restarts only look up that original
+hash. Replies for an abandoned entry invoice retain its old amount/address for
+late returns. Generated incoming invoice hashes are durably remembered across
+players and rounds, so a reused invoice cannot fund two entries. Command errors and background payment errors are separate ABI
+fields, so network trouble cannot be mistaken for a rejected damage credit.
+
+The shared LNURL client caches validated discovery metadata for five minutes
+and reuses HTTPS connections with DNS answers pinned to validated public IPs.
+Pinned clients expire after one minute, then DNS must be validated again.
+Redirects still require separate HTTPS/public-host checks. A failed callback or
+invoice validation invalidates discovery metadata. Payable invoices are never
+cached or reused across payout IDs.
+
+`payment-timings.jsonl` beside `prepaid-match.json` records queue wait, recipient
+invoice retrieval, NWC submission/lookup, incoming receipt lookup, and time from
+a due payout to confirmation. `started_at_ms`/`at_ms` measure actual network
+intervals; `observed_at_ms` shows when the coordinator processed the reply.
+These logs contain IDs and timings, never credentials, invoices or addresses.
+They rotate at approximately 2 MiB, keeping one previous file.
+
+Use `dolphin-controller-mcp/scripts/arena_payment_timings.py PATH` for per-stage
+latencies and observed payment concurrency (`--match-id ID` filters one match).
+Timing success does not replace
+receipt checks or the accounting audit. Sandbox funding buttons and initial
+receiving verification are lobby commands; the in-game hot path never waits on
+them. The worker is concurrent in its I/O while fund mutations remain serialized.
+
 ## Validation
 
 Encrypted local mock-relay tests exercise NIP44 and NIP04 requests, capability

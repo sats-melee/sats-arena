@@ -1,6 +1,7 @@
 //! Wallet-neutral local host for up to four funded humans and CPU participants.
 //! Simulated wallet, live receiving verification, ordered damage and team settlement.
 mod config;
+mod payment_io;
 mod wallet_check;
 
 #[cfg(test)]
@@ -65,11 +66,12 @@ pub struct LocalView {
     pub invoice_sats: u64,
     pub surcharge_sats: u64,
     pub collected_fee_sats: u64,
+    pub payment_error: [u8; 256],
 }
 impl Default for LocalView {
     fn default() -> Self {
         Self {
-            abi_version: 7,
+            abi_version: 8,
             phase: 0,
             busy: 1,
             simulated: 1,
@@ -102,6 +104,7 @@ impl Default for LocalView {
             invoice_sats: 500,
             surcharge_sats: 0,
             collected_fee_sats: 0,
+            payment_error: [0; 256],
         }
     }
 }
@@ -150,6 +153,8 @@ struct Saved {
     prepared: BTreeMap<String, PreparedPayout>,
     #[serde(default)]
     used_payment_hashes: BTreeSet<String>,
+    #[serde(default)]
+    used_entry_hashes: BTreeSet<String>,
     #[serde(default)]
     receipts: Vec<Receipt>,
     #[serde(default = "default_fee_limit")]
@@ -263,8 +268,7 @@ struct Demo {
     saved: Saved,
     path: PathBuf,
     retired_cursor: usize,
-    next_invoice_poll: std::time::Instant,
-    next_retired_poll: std::time::Instant,
+    io: payment_io::PaymentIo,
     _state_lock: std::fs::File,
 }
 impl Demo {
@@ -313,6 +317,11 @@ impl Demo {
             invoices[i] = invoice.bolt11;
             hashes[i] = invoice.payment_hash;
         }
+        let used_entry_hashes = hashes
+            .iter()
+            .filter(|hash| !hash.is_empty())
+            .cloned()
+            .collect();
         Ok(Saved {
             schema: 3,
             wallet_identity: None,
@@ -329,6 +338,7 @@ impl Demo {
             addresses: std::array::from_fn(|_| String::new()),
             prepared: BTreeMap::new(),
             used_payment_hashes: BTreeSet::new(),
+            used_entry_hashes,
             receipts: vec![],
             simulated,
             verification: Default::default(),
@@ -389,14 +399,13 @@ impl Demo {
             };
             let folder = root.join(&identity);
             std::fs::create_dir_all(&folder).map_err(|e| Error::Internal(e.into()))?;
-            let mut demo = Self::open_with(
-                &folder,
-                Arc::new(wallet),
-                Arc::new(LnurlClient),
-                None,
-                default_verifier(),
-            )
-            .await?;
+            let receiving = Arc::new(LnurlClient::default());
+            #[cfg(test)]
+            let verifier = default_verifier();
+            #[cfg(not(test))]
+            let verifier: Arc<dyn AddressVerifier> = receiving.clone();
+            let mut demo =
+                Self::open_with(&folder, Arc::new(wallet), receiving, None, verifier).await?;
             if demo
                 .saved
                 .wallet_identity
@@ -553,6 +562,15 @@ impl Demo {
             }
         }
         saved
+            .used_entry_hashes
+            .extend(saved.hashes.iter().filter(|hash| !hash.is_empty()).cloned());
+        saved.used_entry_hashes.extend(
+            saved
+                .retired_entries
+                .iter()
+                .map(|entry| entry.incoming_hash.clone()),
+        );
+        saved
             .used_payment_hashes
             .extend(saved.prepared.values().map(|p| p.payment_hash.clone()));
         // Activity is a per-application-session display. Financial receipts,
@@ -570,8 +588,7 @@ impl Demo {
             saved,
             path,
             retired_cursor: 0,
-            next_invoice_poll: std::time::Instant::now(),
-            next_retired_poll: std::time::Instant::now(),
+            io: payment_io::PaymentIo::default(),
             _state_lock: state_lock,
         };
         if demo.saved.pot.phase == Phase::Funding && !demo.saved.pot.paid.iter().any(|p| *p) {
@@ -637,6 +654,15 @@ impl Demo {
                         )
                         .await
                         .map_err(Error::Internal)?;
+                    if !self
+                        .saved
+                        .used_entry_hashes
+                        .insert(invoice.payment_hash.clone())
+                    {
+                        return Err(Error::Rejected(
+                            "Wallet reused an entry invoice hash".into(),
+                        ));
+                    }
                     self.saved.invoices[player] = invoice.bolt11;
                     self.saved.hashes[player] = invoice.payment_hash;
                 }
@@ -789,6 +815,8 @@ impl Demo {
         next.max_fee_sats = self.saved.max_fee_sats;
         next.wallet_identity = self.saved.wallet_identity.clone();
         next.used_payment_hashes = self.saved.used_payment_hashes.clone();
+        next.used_entry_hashes
+            .extend(self.saved.used_entry_hashes.iter().cloned());
         self.saved = next;
         self.save()
     }
@@ -1057,350 +1085,6 @@ impl Demo {
             }
         }
     }
-    async fn ensure_entry_invoices(&mut self) -> Result<()> {
-        if self.simulation.is_some()
-            || self.saved.pot.phase != Phase::Funding
-            || self.require_addresses().is_err()
-        {
-            return Ok(());
-        }
-        for player in 0..4 {
-            if self.saved.pot.kinds[player] != 0
-                || self.saved.pot.paid[player]
-                || !self.saved.hashes[player].is_empty()
-            {
-                continue;
-            }
-            let invoice = tokio::time::timeout(
-                Duration::from_secs(15),
-                self.wallet.create_invoice(
-                    self.saved.pot.invoice_sats(),
-                    &format!("{} Player {}", self.saved.pot.id, player + 1),
-                    600,
-                ),
-            )
-            .await
-            .map_err(|_| Error::WalletUnavailable)??;
-            self.saved.invoices[player] = invoice.bolt11;
-            self.saved.hashes[player] = invoice.payment_hash;
-            self.saved.invoice_addresses[player] = self.saved.addresses[player].clone();
-            self.save()?;
-        }
-        Ok(())
-    }
-    async fn reconcile_retired(&mut self) -> Result<()> {
-        let count = self.saved.retired_entries.len();
-        if count == 0 {
-            return Ok(());
-        }
-        if self.simulation.is_some() || std::time::Instant::now() >= self.next_retired_poll {
-            self.next_retired_poll = std::time::Instant::now() + Duration::from_secs(2);
-            for _ in 0..count.min(4) {
-                let index = self.retired_cursor % count;
-                self.retired_cursor = (self.retired_cursor + 1) % count;
-                let entry = self.saved.retired_entries[index].clone();
-                if entry.received_sats.is_some() || entry.state == PayoutState::Paid {
-                    continue;
-                }
-                if let Ok(InvoiceState::Paid { amount_sats }) =
-                    self.wallet.invoice_state(&entry.incoming_hash).await
-                {
-                    self.saved.retired_entries[index].received_sats = Some(amount_sats);
-                    self.event(format!(
-                        "Late Player {} invoice paid — {} sats; returning to original address",
-                        entry.player + 1,
-                        amount_sats
-                    ));
-                    self.save()?;
-                }
-                // Expired/unknown entries remain monitored: settlement can race expiry.
-            }
-        }
-        for index in 0..count {
-            let entry = self.saved.retired_entries[index].clone();
-            let Some(sats) = entry.received_sats else {
-                continue;
-            };
-            if entry.state == PayoutState::Paid {
-                continue;
-            }
-            if sats == 0 {
-                self.saved.retired_entries[index].state = PayoutState::Paid;
-                self.save()?;
-                continue;
-            }
-            if entry.state == PayoutState::Failed {
-                return Err(Error::Rejected(
-                    "A late entry return failed and needs attention".into(),
-                ));
-            }
-            let id = format!("late-entry-{}", entry.incoming_hash);
-            if entry.prepared.is_none() {
-                if entry.state == PayoutState::InFlight {
-                    return Err(Error::Rejected(
-                        "Missing prepared invoice for a late return".into(),
-                    ));
-                }
-                let address = parse_address(&entry.address).map_err(|_| {
-                    Error::Rejected(
-                        "Late entry needs its original receiving address restored".into(),
-                    )
-                })?;
-                let prepared = tokio::time::timeout(
-                    Duration::from_secs(15),
-                    prepare_payout_with_comment(
-                        self.wallet.as_ref(),
-                        self.provider.as_ref(),
-                        &address,
-                        sats,
-                        &id,
-                        "Sats Melee — Entry refunded",
-                    ),
-                )
-                .await
-                .map_err(|_| Error::WalletUnavailable)??;
-                if !self
-                    .saved
-                    .used_payment_hashes
-                    .insert(prepared.payment_hash.clone())
-                {
-                    return Err(Error::Rejected(
-                        "Recipient reused a payment hash for a late entry return".into(),
-                    ));
-                }
-                self.saved.retired_entries[index].prepared = Some(prepared);
-                self.save()?;
-            }
-            let prepared = self.saved.retired_entries[index].prepared.clone().unwrap();
-            let state = if entry.state == PayoutState::Created {
-                self.saved.retired_entries[index].state = PayoutState::InFlight;
-                self.save()?;
-                match tokio::time::timeout(
-                    Duration::from_secs(15),
-                    self.wallet
-                        .pay_invoice(&prepared.invoice, self.saved.max_fee_sats),
-                )
-                .await
-                {
-                    Ok(Ok(state)) => state,
-                    _ => PaymentState::Pending,
-                }
-            } else {
-                tokio::time::timeout(
-                    Duration::from_secs(15),
-                    self.wallet.payment_state(&prepared.payment_hash),
-                )
-                .await
-                .map_err(|_| Error::WalletUnavailable)??
-            };
-            match state {
-                PaymentState::Succeeded { .. } => {
-                    let at_ms = now_ms();
-                    self.saved.retired_entries[index].state = PayoutState::Paid;
-                    self.saved.retired_entries[index]
-                        .prepared
-                        .as_mut()
-                        .unwrap()
-                        .confirmed_at_ms = Some(at_ms);
-                    let receipt = Receipt {
-                        id,
-                        at_ms,
-                        player: entry.player,
-                        address: entry.address,
-                        sats,
-                        detail: "Late entry return".into(),
-                        memo: if prepared.memo.is_empty() {
-                            "Sats Melee — Entry refunded".into()
-                        } else {
-                            prepared.memo.clone()
-                        },
-                    };
-                    let message = receipt_message(&receipt, self.saved.simulated);
-                    self.saved.receipts.push(receipt);
-                    if self.saved.receipts.len() > 100 {
-                        self.saved.receipts.remove(0);
-                    }
-                    self.record_activity(at_ms, message);
-                    self.save()?;
-                }
-                PaymentState::Pending => (),
-                PaymentState::Failed { .. } => {
-                    self.saved.retired_entries[index].state = PayoutState::Failed;
-                    self.save()?;
-                    return Err(Error::Rejected(
-                        "A late entry return failed and needs attention".into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-    async fn reconcile(&mut self) -> Result<()> {
-        self.ensure_entry_invoices().await?;
-        let poll_entries =
-            self.simulation.is_some() || std::time::Instant::now() >= self.next_invoice_poll;
-        if poll_entries {
-            self.next_invoice_poll = std::time::Instant::now() + Duration::from_secs(2);
-        }
-        let previous_count = self.saved.pot.payouts.len();
-        self.saved.pot.flush_due(now_ms());
-        if previous_count != self.saved.pot.payouts.len() {
-            self.save()?;
-        }
-        for player in 0..4 {
-            if self.saved.pot.kinds[player] == 0
-                && !self.saved.pot.paid[player]
-                && self.saved.pot.phase == Phase::Funding
-                && !self.saved.hashes[player].is_empty()
-                && poll_entries
-            {
-                match self
-                    .wallet
-                    .invoice_state(&self.saved.hashes[player])
-                    .await?
-                {
-                    InvoiceState::Paid { amount_sats } => {
-                        // Account for received money before any verification or amount gate.
-                        if amount_sats != self.saved.pot.invoice_sats()
-                            || (!self.saved.invoice_addresses[player].is_empty()
-                                && self.saved.invoice_addresses[player]
-                                    != self.saved.addresses[player])
-                        {
-                            self.retire_entry(player, Some(amount_sats));
-                            self.save()?;
-                            continue;
-                        }
-                        self.saved.pot.confirm_entry(player, amount_sats)?;
-                        self.event(format!(
-                            "Player {} Invoice Paid — {} sats ({} pot + {} fees)",
-                            player + 1,
-                            amount_sats,
-                            self.saved.pot.entry_sats,
-                            self.saved.pot.surcharge_sats()
-                        ));
-                        self.save()?;
-                    }
-                    InvoiceState::Pending => (),
-                    InvoiceState::Expired => {
-                        self.retire_entry(player, None);
-                        self.save()?;
-                    }
-                }
-            }
-        }
-        for index in 0..self.saved.pot.payouts.len() {
-            let payout = self.saved.pot.payouts[index].clone();
-            if payout.state == PayoutState::Paid {
-                continue;
-            }
-            if payout.state == PayoutState::Failed {
-                return Err(Error::Rejected("payout failed; needs attention".into()));
-            }
-            if !self.saved.prepared.contains_key(&payout.id) {
-                if payout.state == PayoutState::InFlight {
-                    return Err(Error::Rejected(
-                        "missing persisted invoice for pending payout".into(),
-                    ));
-                }
-                let address = parse_address(&self.saved.addresses[payout.player])?;
-                let prepared = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    prepare_payout_with_comment(
-                        self.wallet.as_ref(),
-                        self.provider.as_ref(),
-                        &address,
-                        payout.sats,
-                        &payout.id,
-                        &payout_memo(&self.saved.pot, &payout),
-                    ),
-                )
-                .await
-                .map_err(|_| Error::WalletUnavailable)??;
-                // Never resolve this ID again once its invoice is persisted.
-                if self
-                    .saved
-                    .used_payment_hashes
-                    .contains(&prepared.payment_hash)
-                {
-                    return Err(Error::Rejected("recipient reused a payment hash".into()));
-                }
-                self.saved
-                    .used_payment_hashes
-                    .insert(prepared.payment_hash.clone());
-                self.saved.prepared.insert(payout.id.clone(), prepared);
-                self.save()?;
-            }
-            let prepared = self.saved.prepared[&payout.id].clone();
-            let state = match payout.state {
-                PayoutState::Created => {
-                    self.saved.pot.begin_payout(index)?;
-                    self.save()?;
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        self.wallet
-                            .pay_invoice(&prepared.invoice, self.saved.max_fee_sats),
-                    )
-                    .await
-                    {
-                        Ok(Ok(state)) => state,
-                        _ => PaymentState::Pending,
-                    }
-                }
-                PayoutState::InFlight => tokio::time::timeout(
-                    Duration::from_secs(10),
-                    self.wallet.payment_state(&prepared.payment_hash),
-                )
-                .await
-                .map_err(|_| Error::WalletUnavailable)??,
-                _ => unreachable!(),
-            };
-            match state {
-                PaymentState::Succeeded { .. } => {
-                    self.saved.pot.confirm_payout(index)?;
-                    let at_ms = now_ms();
-                    self.saved
-                        .prepared
-                        .get_mut(&payout.id)
-                        .unwrap()
-                        .confirmed_at_ms = Some(at_ms);
-                    self.saved.receipts.push(Receipt {
-                        id: payout.id.clone(),
-                        at_ms,
-                        player: payout.player,
-                        address: prepared.address,
-                        sats: payout.sats,
-                        detail: format!("{:?}", payout.reason),
-                        memo: if prepared.memo.is_empty() {
-                            payout_memo(&self.saved.pot, &payout)
-                        } else {
-                            prepared.memo.clone()
-                        },
-                    });
-                    let message =
-                        receipt_message(self.saved.receipts.last().unwrap(), self.saved.simulated);
-                    self.record_activity(at_ms, message);
-                    if self.saved.receipts.len() > 100 {
-                        self.saved.receipts.remove(0);
-                    }
-                    self.save()?;
-                }
-                PaymentState::Pending => (),
-                PaymentState::Failed { reason } => {
-                    self.saved.pot.payouts[index].state = PayoutState::Failed;
-                    self.save()?;
-                    return Err(Error::Rejected(reason));
-                }
-            }
-        }
-        self.reconcile_retired().await?;
-        self.ensure_entry_invoices().await?;
-        if self.saved.pot.phase == Phase::Settled {
-            if let Some(roster) = self.saved.next_roster.clone() {
-                self.next_match(Some(roster)).await?;
-            }
-        }
-        Ok(())
-    }
     fn view(&self) -> Result<LocalView> {
         let pot = &self.saved.pot;
         let mut view = LocalView {
@@ -1498,7 +1182,7 @@ impl Demo {
 }
 #[cfg(not(test))]
 fn default_verifier() -> Arc<dyn AddressVerifier> {
-    Arc::new(sats_arena_core::wallet::LnurlClient)
+    Arc::new(sats_arena_core::wallet::LnurlClient::default())
 }
 #[cfg(test)]
 fn default_verifier() -> Arc<dyn AddressVerifier> {
@@ -1619,7 +1303,7 @@ pub unsafe extern "C" fn arena_local_create_configured(
                     matches!(&wallet_config, Ok(config::WalletConfig::Sandbox(_, _)));
                 let opening =
                     async { Demo::open_configured(&folder, &live_folder, wallet_config?).await };
-                let mut demo = match runtime.block_on(opening) {
+                let demo = match runtime.block_on(opening) {
                     Ok(value) => value,
                     Err(error) => {
                         let mut view = target.lock().unwrap();
@@ -1631,46 +1315,7 @@ pub unsafe extern "C" fn arena_local_create_configured(
                         return;
                     }
                 };
-                let mut message = String::new();
-                loop {
-                    let processed_action = match receiver.recv_timeout(Duration::from_millis(100)) {
-                        Ok(action) => {
-                            message = runtime
-                                .block_on(demo.command(action))
-                                .err()
-                                .map(|e| e.to_string())
-                                .unwrap_or_default();
-                            true
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => false,
-                    };
-                    let payment_message = runtime
-                        .block_on(demo.reconcile())
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_default();
-                    if let Ok(mut view) = demo.view() {
-                        let mut previous = target.lock().unwrap();
-                        // A command can arrive while an idle snapshot is being
-                        // built. Only its processed acknowledgement may clear
-                        // busy; otherwise the UI could mistake stale Ready for
-                        // the response to its Start request.
-                        if !processed_action && previous.phase != 0 {
-                            view.busy = previous.busy;
-                        }
-                        view.revision = previous.revision + 1;
-                        text(
-                            &mut view.error,
-                            if payment_message.is_empty() {
-                                &message
-                            } else {
-                                &payment_message
-                            },
-                        );
-                        *previous = view;
-                    }
-                }
+                runtime.block_on(run_worker(demo, receiver, target));
             });
         let Ok(worker) = worker else {
             return std::ptr::null_mut();
@@ -1682,6 +1327,53 @@ pub unsafe extern "C" fn arena_local_create_configured(
         }))
     })
     .unwrap_or(std::ptr::null_mut())
+}
+
+// The ledger stays on this coordinator; spawned I/O jobs own only immutable
+// requests and return results. Keeping this runtime alive also services NWC relay
+// events while no game commands are arriving.
+async fn run_worker(
+    mut demo: Demo,
+    receiver: mpsc::Receiver<Command>,
+    target: Arc<Mutex<LocalView>>,
+) {
+    let mut message = String::new();
+    loop {
+        let processed_action = match receiver.try_recv() {
+            Ok(action) => {
+                message = demo
+                    .command(action)
+                    .await
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                true
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => false,
+        };
+        let payment_message = demo
+            .tick()
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        if let Ok(mut view) = demo.view() {
+            let mut previous = target.lock().unwrap();
+            // Only the processed command may clear its busy flag.
+            // Network status must never be mistaken for a credit
+            // rejection or a stale Start acknowledgement.
+            if !processed_action && previous.phase != 0 {
+                view.busy = previous.busy;
+            }
+            view.revision = previous.revision + 1;
+            text(&mut view.error, &message);
+            text(&mut view.payment_error, &payment_message);
+            *previous = view;
+        }
+        // Keep the runtime polling NWC relay tasks between commands.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// # Safety
@@ -2156,7 +1848,12 @@ mod tests {
         fn action(&self, action: u32) -> LocalView {
             self.wait(|v| v.busy == 0);
             assert!(unsafe { arena_local_action(self.0, action) });
-            self.wait(|v| v.busy == 0)
+            let acknowledged = self.wait(|v| v.busy == 0);
+            if matches!(action, 5..=8 | 11 | 12) && acknowledged.error[0] == 0 {
+                self.wait(|v| v.phase == 4)
+            } else {
+                acknowledged
+            }
         }
         fn credit(&self, totals: [u64; 2]) -> LocalView {
             self.wait(|v| v.busy == 0);
@@ -2170,9 +1867,11 @@ mod tests {
             assert!(unsafe { arena_local_addresses(self.0, first.as_ptr(), second.as_ptr()) });
             self.wait(|v| v.busy == 0);
             assert_eq!(self.action(4).phase, 1);
-            assert_eq!(self.action(2).paid_sats, [500, 0, 0, 0]);
+            self.action(2);
+            assert_eq!(self.wait(|v| v.paid_sats[0] != 0).paid_sats, [500, 0, 0, 0]);
             assert_eq!(self.action(4).phase, 1);
-            assert_eq!(self.action(3).phase, 2);
+            self.action(3);
+            self.wait(|v| v.phase == 2);
             assert_eq!(self.action(4).phase, 3);
         }
     }
@@ -2184,7 +1883,7 @@ mod tests {
 
     #[test]
     fn two_fresh_invoices_live_outgoing_payout_then_winner_pot_and_new_invoices() {
-        assert_eq!(std::mem::size_of::<LocalView>(), 14504);
+        assert_eq!(std::mem::size_of::<LocalView>(), 14760);
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
         let initial = host.wait(|v| v.busy == 0);
@@ -2438,3 +2137,6 @@ mod four_player_tests;
 
 #[cfg(test)]
 mod retired_tests;
+
+#[cfg(test)]
+mod payment_io_tests;

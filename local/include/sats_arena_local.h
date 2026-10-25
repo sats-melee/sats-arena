@@ -25,8 +25,9 @@ typedef struct ArenaLocalView {
     uint64_t batch_window_ms;
     uint32_t surcharge_bps;
     uint64_t invoice_sats, surcharge_sats, collected_fee_sats;
+    char payment_error[256];
 } ArenaLocalView;
-/* ABI 7. Fresh entry invoices for every participating human. No reusable account balance.
+/* ABI 8. Fresh entry invoices for every participating human. No reusable account balance.
  * Phase: 0 loading, 1 awaiting entry, 2 paid, 3 playing, 4 paid out,
  * 6 payouts pending, 7 error.
  * Actions: 1 next match, 2/3 pay sandbox entry (or simulate in unit-test fake mode) P1/P2, 4 start,

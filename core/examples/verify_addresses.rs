@@ -3,7 +3,7 @@ use sats_arena_core::wallet::{AddressVerifier, LightningAddress, LnurlClient};
 async fn main() {
     for address in std::env::args().skip(1) {
         let result = match LightningAddress::parse(&address) {
-            Ok(address) => LnurlClient.verify(&address).await,
+            Ok(address) => LnurlClient::default().verify(&address).await,
             Err(error) => Err(error),
         };
         match result {

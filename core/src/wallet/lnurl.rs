@@ -7,8 +7,10 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, SocketAddr},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_BODY: usize = 256 * 1024;
@@ -42,7 +44,46 @@ pub trait AddressVerifier: Send + Sync {
 }
 
 #[derive(Clone, Default)]
-pub struct LnurlClient;
+pub struct LnurlClient {
+    cache: Arc<ReceivingCache>,
+}
+#[derive(Default)]
+struct ReceivingCache {
+    requests: Mutex<BTreeMap<String, Cached<PayRequest>>>,
+    clients: Mutex<BTreeMap<String, Cached<Client>>>,
+}
+struct Cached<T> {
+    value: T,
+    until: Instant,
+}
+const DISCOVERY_TTL: Duration = Duration::from_secs(5 * 60);
+const CONNECTION_TTL: Duration = Duration::from_secs(60);
+const MAX_CACHED_HOSTS: usize = 128;
+fn cached<T: Clone>(cache: &Mutex<BTreeMap<String, Cached<T>>>, key: &str) -> Option<T> {
+    let mut entries = cache.lock().unwrap();
+    entries.retain(|_, entry| entry.until > Instant::now());
+    entries.get(key).map(|entry| entry.value.clone())
+}
+fn remember<T>(cache: &Mutex<BTreeMap<String, Cached<T>>>, key: String, value: T, ttl: Duration) {
+    let mut entries = cache.lock().unwrap();
+    entries.retain(|_, entry| entry.until > Instant::now());
+    if entries.len() >= MAX_CACHED_HOSTS {
+        if let Some(oldest) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.until)
+            .map(|(key, _)| key.clone())
+        {
+            entries.remove(&oldest);
+        }
+    }
+    entries.insert(
+        key,
+        Cached {
+            value,
+            until: Instant::now() + ttl,
+        },
+    );
+}
 #[derive(Deserialize, Clone)]
 struct PayRequest {
     tag: String,
@@ -261,32 +302,49 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 impl LnurlClient {
+    async fn client_for(&self, host: &str) -> anyhow::Result<Client> {
+        if let Some(client) = cached(&self.cache.clients, host) {
+            return Ok(client);
+        }
+        // A reusable client pins only validated public DNS answers. It is
+        // discarded after one minute; a fresh client must validate DNS again.
+        let addresses: Vec<SocketAddr> =
+            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
+                .await
+                .context("receiving-service DNS timed out")??
+                .collect();
+        ensure!(
+            !addresses.is_empty() && addresses.iter().all(|s| public_ip(s.ip())),
+            "receiving service did not resolve to public addresses"
+        );
+        let client = Client::builder()
+            .no_proxy()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .user_agent("SatsArena/0.1 LNURL verification")
+            .resolve_to_addrs(host, &addresses)
+            .build()?;
+        remember(
+            &self.cache.clients,
+            host.to_owned(),
+            client.clone(),
+            CONNECTION_TTL,
+        );
+        Ok(client)
+    }
     async fn get_json(&self, mut url: Url) -> anyhow::Result<serde_json::Value> {
         for redirects in 0..=3 {
-            let host = url.host_str().context("missing host")?;
-            // Pin validated DNS answers for this request. Redirects are not followed.
-            let addresses: Vec<SocketAddr> =
-                tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
-                    .await
-                    .context("receiving-service DNS timed out")??
-                    .collect();
-            ensure!(
-                !addresses.is_empty() && addresses.iter().all(|s| public_ip(s.ip())),
-                "receiving service did not resolve to public addresses"
-            );
-            let client = Client::builder()
-                .no_proxy()
-                .https_only(true)
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10))
-                .user_agent("SatsArena/0.1 LNURL verification")
-                .resolve_to_addrs(host, &addresses)
-                .build()?;
-            let mut response = client
-                .get(url.clone())
-                .send()
-                .await
-                .context("receiving service is unreachable")?;
+            let host = url.host_str().context("missing host")?.to_owned();
+            let client = self.client_for(&host).await?;
+            let mut response = match client.get(url.clone()).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    self.cache.clients.lock().unwrap().remove(&host);
+                    return Err(error).context("receiving service is unreachable");
+                }
+            };
             if response.status().is_redirection() {
                 ensure!(redirects < 3, "receiving service redirected too many times");
                 let location = response
@@ -321,6 +379,9 @@ impl LnurlClient {
         anyhow::bail!("receiving service redirected too many times")
     }
     async fn discover(&self, address: &LightningAddress) -> anyhow::Result<PayRequest> {
+        if let Some(request) = cached(&self.cache.requests, address.as_str()) {
+            return Ok(request);
+        }
         let (user, domain) = address
             .as_str()
             .split_once('@')
@@ -329,7 +390,14 @@ impl LnurlClient {
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid address URL"))?
             .extend([".well-known", "lnurlp", user]);
-        parse_request(self.get_json(url).await?)
+        let request = parse_request(self.get_json(url).await?)?;
+        remember(
+            &self.cache.requests,
+            address.as_str().to_owned(),
+            request.clone(),
+            DISCOVERY_TTL,
+        );
+        Ok(request)
     }
     async fn request_invoice(
         &self,
@@ -402,7 +470,15 @@ impl AddressInvoices for LnurlClient {
         let msat = sats
             .checked_mul(1000)
             .context("payment amount is too large")?;
-        Ok(self.request_invoice(&request, msat, Some(comment)).await?.0)
+        match self.request_invoice(&request, msat, Some(comment)).await {
+            Ok(invoice) => Ok(invoice.0),
+            Err(error) => {
+                // A changed callback, metadata or receiving limit must cause
+                // discovery again on retry. No payable invoice is cached.
+                self.cache.requests.lock().unwrap().remove(address.as_str());
+                Err(error)
+            }
+        }
     }
 }
 
@@ -608,5 +684,53 @@ mod tests {
         verified.min_msat = 1000;
         verified.max_msat = 999_999;
         assert!(!verified.supports_match(500));
+    }
+    #[test]
+    fn receiving_cache_is_shared_bounded_and_expires() {
+        let client = LnurlClient::default();
+        let clone = client.clone();
+        remember(
+            &client.cache.requests,
+            "alice@receiver.example".into(),
+            request(),
+            DISCOVERY_TTL,
+        );
+        assert!(cached(&clone.cache.requests, "alice@receiver.example").is_some());
+        assert!(cached(&clone.cache.requests, "bob@receiver.example").is_none());
+        remember(
+            &client.cache.requests,
+            "expired@receiver.example".into(),
+            request(),
+            Duration::ZERO,
+        );
+        assert!(cached(&clone.cache.requests, "expired@receiver.example").is_none());
+        for i in 0..150 {
+            remember(
+                &client.cache.requests,
+                format!("p{i}@receiver.example"),
+                request(),
+                DISCOVERY_TTL,
+            );
+        }
+        assert_eq!(
+            client.cache.requests.lock().unwrap().len(),
+            MAX_CACHED_HOSTS
+        );
+    }
+    #[tokio::test]
+    async fn invalid_cached_callback_is_evicted_without_fetching_or_paying() {
+        let client = LnurlClient::default();
+        let address = LightningAddress::parse("alice@receiver.example").unwrap();
+        let mut invalid = request();
+        invalid.callback = "https://localhost/pay".into();
+        remember(
+            &client.cache.requests,
+            address.as_str().into(),
+            invalid,
+            DISCOVERY_TTL,
+        );
+        assert!(client.invoice(&address, 1, "bad-callback").await.is_err());
+        assert!(cached(&client.cache.requests, address.as_str()).is_none());
+        assert!(client.cache.clients.lock().unwrap().is_empty());
     }
 }

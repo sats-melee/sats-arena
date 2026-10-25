@@ -22,8 +22,6 @@ async fn open(path: &Path, wallet: Arc<FakeWallet>) -> Demo {
 }
 async fn reconcile_now(demo: &mut Demo) {
     // Drive the injected-wallet lifecycle without sleeping for network polling cadence.
-    demo.next_invoice_poll = std::time::Instant::now();
-    demo.next_retired_poll = std::time::Instant::now();
     demo.reconcile().await.unwrap();
 }
 async fn verified_room(demo: &mut Demo) {
