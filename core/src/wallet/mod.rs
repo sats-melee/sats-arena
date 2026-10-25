@@ -5,7 +5,9 @@ mod address;
 mod fake;
 mod lnurl;
 mod nwc;
-pub use address::{AddressInvoices, LightningAddress, PreparedPayout, prepare_payout};
+pub use address::{
+    AddressInvoices, LightningAddress, PreparedPayout, prepare_payout, prepare_payout_with_comment,
+};
 pub use lnurl::{AddressVerification, AddressVerifier, LnurlClient, VERIFICATION_TTL_MS};
 
 use async_trait::async_trait;

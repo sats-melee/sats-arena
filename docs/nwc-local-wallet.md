@@ -73,6 +73,27 @@ They never silently switch to a fake wallet.
 
 ## Wallet behavior and fees
 
+Payouts carry a saved, human-readable label: **Sats Melee — Damage payout**,
+**Sats Melee — Match won**, the winning team's color and **team victory**, or
+**Sats Melee — Entry refunded**. Losing players' unbatched damage paid at the
+end remains labeled as damage; no-contests and CPU-only victories return entries.
+
+When resolving the recipient's Lightning Address, the LNURL provider sends the
+label as a LUD-12 `comment` only if `commentAllowed` is positive. It respects
+the provider's character limit and the callback URL size, using proper URL
+encoding. Providers without comments continue to receive payments normally.
+Invoice signatures, amount and expiry remain checked. Hashed descriptions must
+match the receiving metadata; signed text descriptions must match its text or
+the exact comment actually sent (including any length truncation).
+
+The full label is saved with the prepared invoice before payment and copied
+to the confirmed receipt. Recovery reuses that invoice and label; older prepared
+invoices without labels remain readable and are not replaced or resent to add
+a comment. The payment log shows the reason and team without repeating the
+application name on every line. Whether a receiving wallet displays the comment
+depends on its provider and UI. `core/examples/nwc_receipt_memos.rs` can check
+receiver-side NWC metadata read-only, with credentials supplied on private stdin.
+
 The NWC adapter uses the maintained Rust NWC SDK with NIP44 encryption and NIP04
 compatibility. Startup probes get_info, requiring make_invoice, lookup_invoice
 and pay_invoice, plus Bitcoin-mainnet invoice validation. A startup probe creates

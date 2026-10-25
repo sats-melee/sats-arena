@@ -105,6 +105,7 @@ fn address_change_retires_its_invoice_and_late_payment_returns_to_original_recei
         assert_eq!(receipt.address, "alice@example.test");
         assert_eq!(receipt.sats, 500);
         assert_eq!(receipt.detail, "Late entry return");
+        assert_eq!(receipt.memo, "Sats Melee — Entry refunded");
         assert_eq!(demo.saved.addresses[0], "carol@example.test");
         assert_eq!(demo.saved.pot.paid, [false; 4]);
         assert_eq!(demo.saved.pot.remaining, [0; 4]);

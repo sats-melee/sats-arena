@@ -54,6 +54,38 @@ struct PayRequest {
     max_msat: u64,
     #[serde(default, rename = "payerData")]
     payer_data: serde_json::Value,
+    #[serde(default, rename = "commentAllowed")]
+    comment_allowed: u64,
+}
+
+fn callback_url(request: &PayRequest, msat: u64, comment: Option<&str>) -> anyhow::Result<Url> {
+    ensure!(
+        (request.min_msat..=request.max_msat).contains(&msat),
+        "amount is outside receiving limits"
+    );
+    let mut url = checked_url(&request.callback)?;
+    ensure!(
+        !url.query_pairs()
+            .any(|(key, _)| key == "amount" || key == "comment"),
+        "callback already contains an amount or comment"
+    );
+    url.query_pairs_mut()
+        .append_pair("amount", &msat.to_string());
+    if request.comment_allowed > 0 {
+        let limit = request.comment_allowed.min(256) as usize;
+        let mut text: String = comment.unwrap_or_default().chars().take(limit).collect();
+        // LUD-12 also limits the whole callback URL. Shorten at character
+        // boundaries, including percent encoding, without changing metadata.
+        while !text.is_empty() {
+            let mut candidate = url.clone();
+            candidate.query_pairs_mut().append_pair("comment", &text);
+            if candidate.as_str().len() <= 2000 {
+                return Ok(candidate);
+            }
+            text.pop();
+        }
+    }
+    Ok(url)
 }
 
 fn public_ip(ip: IpAddr) -> bool {
@@ -168,6 +200,7 @@ fn validate_invoice(
     request: &PayRequest,
     msat: u64,
     now_ms: u64,
+    sent_comment: Option<&str>,
 ) -> anyhow::Result<(String, u64)> {
     let invoice: Bolt11Invoice = invoice
         .parse()
@@ -198,8 +231,11 @@ fn validate_invoice(
                 .and_then(|v| v.as_str())
                 .context("missing metadata description")?;
             ensure!(
-                description.to_string() == text,
-                "signed invoice description does not match receiving metadata"
+                description.to_string() == text
+                    || sent_comment.is_some_and(
+                        |comment| !comment.is_empty() && description.to_string() == comment
+                    ),
+                "signed invoice description does not match receiving metadata or the sent comment"
             );
         }
     }
@@ -299,25 +335,21 @@ impl LnurlClient {
         &self,
         request: &PayRequest,
         msat: u64,
+        comment: Option<&str>,
     ) -> anyhow::Result<(String, String, u64)> {
-        ensure!(
-            (request.min_msat..=request.max_msat).contains(&msat),
-            "amount is outside receiving limits"
-        );
-        let mut url = checked_url(&request.callback)?;
-        ensure!(
-            !url.query_pairs().any(|(key, _)| key == "amount"),
-            "callback already contains an amount"
-        );
-        url.query_pairs_mut()
-            .append_pair("amount", &msat.to_string());
+        let url = callback_url(request, msat, comment)?;
+        let sent_comment = url
+            .query_pairs()
+            .find(|(key, _)| key == "comment")
+            .map(|(_, value)| value.into_owned());
         let value = self.get_json(url).await?;
         service_error(&value)?;
         let invoice = value
             .get("pr")
             .and_then(|v| v.as_str())
             .context("receiving service returned no invoice")?;
-        let (hash, expiry) = validate_invoice(invoice, request, msat, now_ms())?;
+        let (hash, expiry) =
+            validate_invoice(invoice, request, msat, now_ms(), sent_comment.as_deref())?;
         Ok((invoice.into(), hash, expiry))
     }
 }
@@ -331,7 +363,7 @@ impl AddressVerifier for LnurlClient {
             .max(1)
             .checked_mul(1000)
             .context("receiving minimum is too large")?;
-        let (invoice, hash, expiry) = self.request_invoice(&request, test_msat).await?;
+        let (invoice, hash, expiry) = self.request_invoice(&request, test_msat, None).await?;
         let invoice: Bolt11Invoice = invoice.parse()?;
         Ok(AddressVerification {
             address: address.as_str().into(),
@@ -355,13 +387,22 @@ impl AddressInvoices for LnurlClient {
         &self,
         address: &LightningAddress,
         sats: u64,
+        id: &str,
+    ) -> anyhow::Result<String> {
+        self.invoice_with_comment(address, sats, id, "").await
+    }
+    async fn invoice_with_comment(
+        &self,
+        address: &LightningAddress,
+        sats: u64,
         _: &str,
+        comment: &str,
     ) -> anyhow::Result<String> {
         let request = self.discover(address).await?;
         let msat = sats
             .checked_mul(1000)
             .context("payment amount is too large")?;
-        Ok(self.request_invoice(&request, msat).await?.0)
+        Ok(self.request_invoice(&request, msat, Some(comment)).await?.0)
     }
 }
 
@@ -380,6 +421,45 @@ mod tests {
             "metadata":"[[\"text/plain\",\"Alice payments\"],[\"text/identifier\",\"alice@receiver.example\"]]",
             "minSendable":1000, "maxSendable":10_000_000,
         })).unwrap()
+    }
+    #[test]
+    fn comments_are_optional_encoded_and_limited_without_changing_metadata() {
+        let mut request = request();
+        let memo = "Sats Melee — Red team victory & payout";
+        let metadata = request.metadata.clone();
+        // Absence of commentAllowed means unsupported, not a blocked payout.
+        assert!(
+            !callback_url(&request, 1000, Some(memo))
+                .unwrap()
+                .query_pairs()
+                .any(|(k, _)| k == "comment")
+        );
+        request.comment_allowed = 100;
+        let url = callback_url(&request, 1000, Some(memo)).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(pairs["comment"], memo);
+        assert_eq!(pairs["amount"], "1000");
+        assert_eq!(pairs["user"], "alice");
+        assert_eq!(request.metadata, metadata);
+        request.comment_allowed = 12;
+        let short = callback_url(&request, 1000, Some(memo)).unwrap();
+        assert_eq!(
+            short.query_pairs().find(|(k, _)| k == "comment").unwrap().1,
+            "Sats Melee —"
+        );
+        assert!(
+            !callback_url(&request, 1000, None)
+                .unwrap()
+                .query_pairs()
+                .any(|(k, _)| k == "comment")
+        );
+        request.callback = "https://receiver.example/pay?comment=other".into();
+        assert!(callback_url(&request, 1000, Some(memo)).is_err());
+        request.callback = "https://receiver.example/pay?amount=2000".into();
+        assert!(callback_url(&request, 1000, Some(memo)).is_err());
     }
     fn invoice(
         request: &PayRequest,
@@ -409,13 +489,13 @@ mod tests {
         let request = request();
         let now = 1_800_000_000_000;
         let hash_invoice = invoice(&request, 1000, now, None, Currency::Bitcoin);
-        assert!(validate_invoice(&hash_invoice, &request, 1000, now).is_ok());
-        assert!(validate_invoice(&hash_invoice, &request, 2000, now).is_err());
-        assert!(validate_invoice(&hash_invoice, &request, 1000, now + 3_600_000).is_err());
-        assert!(validate_invoice(&hash_invoice, &request, 1000, now - 120_000).is_err());
+        assert!(validate_invoice(&hash_invoice, &request, 1000, now, None).is_ok());
+        assert!(validate_invoice(&hash_invoice, &request, 2000, now, None).is_err());
+        assert!(validate_invoice(&hash_invoice, &request, 1000, now + 3_600_000, None).is_err());
+        assert!(validate_invoice(&hash_invoice, &request, 1000, now - 120_000, None).is_err());
         let mut changed = request.clone();
         changed.metadata.push(' ');
-        assert!(validate_invoice(&hash_invoice, &changed, 1000, now).is_err());
+        assert!(validate_invoice(&hash_invoice, &changed, 1000, now, None).is_err());
         let direct = invoice(
             &request,
             1000,
@@ -423,12 +503,43 @@ mod tests {
             Some("Alice payments"),
             Currency::Bitcoin,
         );
-        assert!(validate_invoice(&direct, &request, 1000, now).is_ok());
+        assert!(validate_invoice(&direct, &request, 1000, now, None).is_ok());
         let wrong = invoice(&request, 1000, now, Some("Someone else"), Currency::Bitcoin);
-        assert!(validate_invoice(&wrong, &request, 1000, now).is_err());
+        assert!(validate_invoice(&wrong, &request, 1000, now, None).is_err());
         let testnet = invoice(&request, 1000, now, None, Currency::BitcoinTestnet);
-        assert!(validate_invoice(&testnet, &request, 1000, now).is_err());
-        assert!(validate_invoice("not-an-invoice", &request, 1000, now).is_err());
+        assert!(validate_invoice(&testnet, &request, 1000, now, None).is_err());
+        assert!(validate_invoice("not-an-invoice", &request, 1000, now, None).is_err());
+    }
+
+    #[test]
+    fn signed_direct_comment_must_match_the_exact_comment_sent() {
+        let mut request = request();
+        request.comment_allowed = 18;
+        let url = callback_url(&request, 1000, Some("Sats Melee — Damage payout")).unwrap();
+        let sent = url
+            .query_pairs()
+            .find(|(key, _)| key == "comment")
+            .unwrap()
+            .1
+            .into_owned();
+        let now = 1_800_000_000_000;
+        let direct = invoice(&request, 1000, now, Some(&sent), Currency::Bitcoin);
+        assert!(validate_invoice(&direct, &request, 1000, now, Some(&sent)).is_ok());
+        assert!(validate_invoice(&direct, &request, 1000, now, None).is_err());
+        assert!(validate_invoice(&direct, &request, 1000, now, Some("Different memo")).is_err());
+        assert!(validate_invoice(&direct, &request, 2000, now, Some(&sent)).is_err());
+        let unrelated = invoice(
+            &request,
+            1000,
+            now,
+            Some("Other recipient"),
+            Currency::Bitcoin,
+        );
+        assert!(validate_invoice(&unrelated, &request, 1000, now, Some(&sent)).is_err());
+        let hashed = invoice(&request, 1000, now, None, Currency::Bitcoin);
+        let mut changed = request.clone();
+        changed.metadata.push(' ');
+        assert!(validate_invoice(&hashed, &changed, 1000, now, Some(&sent)).is_err());
     }
     #[test]
     fn bad_endpoints_limits_metadata_and_required_payer_data_are_rejected() {

@@ -3,13 +3,17 @@
 mod config;
 mod wallet_check;
 
+#[cfg(test)]
+use sats_arena_core::wallet::prepare_payout;
+
 use sats_arena_core::{
     Error, Result,
     arena_pot::{Credit, MatchPot},
-    pot::{PayoutState, Phase},
+    pot::{Outcome, Payout, PayoutState, Phase, Reason},
     wallet::{
         AddressInvoices, AddressVerification, AddressVerifier, FakeAddressInvoices, FakeWallet,
-        InvoiceState, LightningAddress, PaymentState, PreparedPayout, Wallet, prepare_payout,
+        InvoiceState, LightningAddress, PaymentState, PreparedPayout, Wallet,
+        prepare_payout_with_comment,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -161,14 +165,66 @@ struct Activity {
     message: String,
 }
 fn receipt_message(receipt: &Receipt, simulated: bool) -> String {
+    let detail = if receipt.memo.is_empty() {
+        &receipt.detail
+    } else {
+        receipt
+            .memo
+            .strip_prefix("Sats Melee — ")
+            .unwrap_or(&receipt.memo)
+    };
     format!(
         "{}Player {} received {} sats • {} → {}",
         if simulated { "SIMULATED " } else { "" },
         receipt.player + 1,
         receipt.sats,
-        receipt.detail.to_lowercase(),
+        detail.to_lowercase(),
         receipt.address
     )
+}
+
+fn payout_memo(pot: &MatchPot, payout: &Payout) -> String {
+    let victory = |player: usize| {
+        if pot.teams {
+            let team = match pot.team_ids[player] {
+                0 => "Red",
+                1 => "Blue",
+                2 => "Green",
+                _ => "Winning",
+            };
+            format!("{team} team victory")
+        } else {
+            "Match won".into()
+        }
+    };
+    let reason = match payout.reason {
+        Reason::Damage => "Damage payout".into(),
+        Reason::Return => "Entry refunded".into(),
+        Reason::WinnerPot => victory(payout.player),
+        Reason::Settlement => match pot.outcome {
+            Some(Outcome::NoContest) => "Entry refunded".into(),
+            Some(Outcome::Winner(winner)) => {
+                let same_side = |player: usize| {
+                    if pot.teams {
+                        pot.team_ids[player] == pot.team_ids[winner]
+                    } else {
+                        player == winner
+                    }
+                };
+                let human_winners =
+                    (0..4).any(|player| pot.kinds[player] == 0 && same_side(player));
+                if !human_winners {
+                    "Entry refunded".into()
+                } else if same_side(payout.player) {
+                    victory(payout.player)
+                } else {
+                    "Damage payout".into()
+                }
+            }
+            None => "Match settlement".into(),
+        },
+    };
+    format!("Sats Melee — {reason}")
 }
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct AddressCheck {
@@ -183,6 +239,8 @@ struct Receipt {
     address: String,
     sats: u64,
     detail: String,
+    #[serde(default)]
+    memo: String,
 }
 struct Demo {
     wallet: Arc<dyn Wallet>,
@@ -466,6 +524,7 @@ impl Demo {
                             invoice,
                             payment_hash,
                             confirmed_at_ms: None,
+                            memo: String::new(),
                         },
                     );
                 }
@@ -1014,12 +1073,13 @@ impl Demo {
                 })?;
                 let prepared = tokio::time::timeout(
                     Duration::from_secs(15),
-                    prepare_payout(
+                    prepare_payout_with_comment(
                         self.wallet.as_ref(),
                         self.provider.as_ref(),
                         &address,
                         sats,
                         &id,
+                        "Sats Melee — Entry refunded",
                     ),
                 )
                 .await
@@ -1074,6 +1134,11 @@ impl Demo {
                         address: entry.address,
                         sats,
                         detail: "Late entry return".into(),
+                        memo: if prepared.memo.is_empty() {
+                            "Sats Melee — Entry refunded".into()
+                        } else {
+                            prepared.memo.clone()
+                        },
                     };
                     let message = receipt_message(&receipt, self.saved.simulated);
                     self.saved.receipts.push(receipt);
@@ -1163,12 +1228,13 @@ impl Demo {
                 let address = parse_address(&self.saved.addresses[payout.player])?;
                 let prepared = tokio::time::timeout(
                     Duration::from_secs(10),
-                    prepare_payout(
+                    prepare_payout_with_comment(
                         self.wallet.as_ref(),
                         self.provider.as_ref(),
                         &address,
                         payout.sats,
                         &payout.id,
+                        &payout_memo(&self.saved.pot, &payout),
                     ),
                 )
                 .await
@@ -1227,6 +1293,11 @@ impl Demo {
                         address: prepared.address,
                         sats: payout.sats,
                         detail: format!("{:?}", payout.reason),
+                        memo: if prepared.memo.is_empty() {
+                            payout_memo(&self.saved.pot, &payout)
+                        } else {
+                            prepared.memo.clone()
+                        },
                     });
                     let message =
                         receipt_message(self.saved.receipts.last().unwrap(), self.saved.simulated);
@@ -1970,12 +2041,13 @@ mod tests {
             demo.saved.pot.flush_due(5_000);
             let payout = &demo.saved.pot.payouts[0];
             let address = parse_address(&demo.saved.addresses[0]).unwrap();
-            let prepared = prepare_payout(
+            let prepared = prepare_payout_with_comment(
                 demo.wallet.as_ref(),
                 demo.provider.as_ref(),
                 &address,
                 payout.sats,
                 &payout.id,
+                "Sats Melee — Damage payout",
             )
             .await
             .unwrap();
@@ -1984,6 +2056,10 @@ mod tests {
             demo.save().unwrap(); // Crash before a conclusive outgoing acknowledgement.
             drop(demo);
             let mut recovered = Demo::open(dir.path()).await.unwrap();
+            assert_eq!(
+                recovered.saved.prepared.values().next().unwrap().memo,
+                "Sats Melee — Damage payout"
+            );
             recovered.reconcile().await.unwrap();
             assert_eq!(recovered.simulation.as_ref().unwrap().payment_attempts(), 0);
             assert_eq!(recovered.view().unwrap().pending_sats, [8, 0, 0, 0]);

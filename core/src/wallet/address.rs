@@ -48,6 +48,18 @@ pub trait AddressInvoices: Send + Sync {
         sats: u64,
         payout_id: &str,
     ) -> anyhow::Result<String>;
+
+    /// Optional recipient-visible context. Providers without comments still pay
+    /// normally; the complete label remains in the prepared payment/history.
+    async fn invoice_with_comment(
+        &self,
+        address: &LightningAddress,
+        sats: u64,
+        payout_id: &str,
+        _comment: &str,
+    ) -> anyhow::Result<String> {
+        self.invoice(address, sats, payout_id).await
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +68,8 @@ pub struct PreparedPayout {
     pub invoice: String,
     pub payment_hash: String,
     pub confirmed_at_ms: Option<u64>,
+    #[serde(default)]
+    pub memo: String,
 }
 
 /// Validate through the wallet adapter, including exact amount. Persist the
@@ -67,8 +81,21 @@ pub async fn prepare_payout(
     sats: u64,
     payout_id: &str,
 ) -> anyhow::Result<PreparedPayout> {
+    prepare_payout_with_comment(wallet, provider, address, sats, payout_id, "").await
+}
+
+pub async fn prepare_payout_with_comment(
+    wallet: &dyn Wallet,
+    provider: &dyn AddressInvoices,
+    address: &LightningAddress,
+    sats: u64,
+    payout_id: &str,
+    comment: &str,
+) -> anyhow::Result<PreparedPayout> {
     anyhow::ensure!(sats != 0, "cannot pay a zero-sat invoice");
-    let invoice = provider.invoice(address, sats, payout_id).await?;
+    let invoice = provider
+        .invoice_with_comment(address, sats, payout_id, comment)
+        .await?;
     let decoded = wallet.decode_invoice(&invoice)?;
     anyhow::ensure!(
         decoded.amount_sats == Some(sats),
@@ -83,6 +110,7 @@ pub async fn prepare_payout(
         invoice,
         payment_hash: decoded.payment_hash,
         confirmed_at_ms: None,
+        memo: comment.to_owned(),
     })
 }
 
@@ -141,6 +169,66 @@ mod tests {
             prepare_payout(&wallet, &WrongAmount, &address, 42, "batch-1")
                 .await
                 .is_err()
+        );
+        assert_eq!(wallet.payment_attempts(), 0);
+    }
+
+    #[tokio::test]
+    async fn memo_is_forwarded_and_persisted_even_without_provider_comment_support() {
+        struct Comments(std::sync::Mutex<String>);
+        #[async_trait]
+        impl AddressInvoices for Comments {
+            async fn invoice(
+                &self,
+                address: &LightningAddress,
+                sats: u64,
+                id: &str,
+            ) -> anyhow::Result<String> {
+                FakeAddressInvoices.invoice(address, sats, id).await
+            }
+            async fn invoice_with_comment(
+                &self,
+                address: &LightningAddress,
+                sats: u64,
+                id: &str,
+                comment: &str,
+            ) -> anyhow::Result<String> {
+                *self.0.lock().unwrap() = comment.to_owned();
+                self.invoice(address, sats, id).await
+            }
+        }
+        let wallet = FakeWallet::default();
+        let address = LightningAddress::parse("alice@example.com").unwrap();
+        let provider = Comments(std::sync::Mutex::new(String::new()));
+        let memo = "Sats Melee — Match won";
+        let prepared =
+            prepare_payout_with_comment(&wallet, &provider, &address, 42, "batch-1", memo)
+                .await
+                .unwrap();
+        assert_eq!(*provider.0.lock().unwrap(), memo);
+        assert_eq!(prepared.memo, memo);
+        let restored: PreparedPayout =
+            serde_json::from_str(&serde_json::to_string(&prepared).unwrap()).unwrap();
+        assert_eq!(restored.memo, memo);
+        assert_eq!(restored.invoice, prepared.invoice);
+        let unsupported = prepare_payout_with_comment(
+            &wallet,
+            &FakeAddressInvoices,
+            &address,
+            42,
+            "batch-2",
+            memo,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unsupported.memo, memo);
+        let mut legacy = serde_json::to_value(prepared).unwrap();
+        legacy.as_object_mut().unwrap().remove("memo");
+        assert!(
+            serde_json::from_value::<PreparedPayout>(legacy)
+                .unwrap()
+                .memo
+                .is_empty()
         );
         assert_eq!(wallet.payment_attempts(), 0);
     }

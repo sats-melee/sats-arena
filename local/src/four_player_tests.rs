@@ -161,15 +161,28 @@ fn four_player_ffa_sequences_pay_exact_recipients_and_log_winner() {
         assert_eq!(demo.view().unwrap().earned_sats, [8, 0, 0, 12]);
         assert_eq!(demo.saved.pot.phase, Phase::Playing);
         assert_eq!(demo.saved.receipts.len(), 2);
-        assert!(log(&demo).contains("Player 1 received 8 sats • damage → player1@example.test"));
-        assert!(log(&demo).contains("Player 4 received 12 sats • damage → player4@example.test"));
+        assert!(
+            log(&demo).contains("Player 1 received 8 sats • damage payout → player1@example.test")
+        );
+        assert!(
+            log(&demo).contains("Player 4 received 12 sats • damage payout → player4@example.test")
+        );
         demo.command(Command::Action(11)).await.unwrap(); // P3
         demo.reconcile().await.unwrap();
         assert_eq!(demo.view().unwrap().earned_sats, [8, 0, 1980, 12]);
         assert_eq!(demo.saved.pot.phase, Phase::Settled);
         assert!(log(&demo).contains("Player 3 wins"));
         assert!(
-            log(&demo).contains("Player 3 received 1980 sats • settlement → player3@example.test")
+            log(&demo).contains("Player 3 received 1980 sats • match won → player3@example.test")
+        );
+        assert_eq!(
+            demo.saved
+                .receipts
+                .iter()
+                .find(|r| r.player == 2)
+                .unwrap()
+                .memo,
+            "Sats Melee — Match won"
         );
         conserved(&demo);
     });
@@ -232,6 +245,25 @@ fn team_match_excludes_cpu_and_friendly_fire_and_logs_the_winning_team() {
         assert_eq!(demo.view().unwrap().earned_sats, [8, 1492, 0, 0]);
         assert!(log(&demo).contains("Blue Team wins"));
         assert!(demo.saved.receipts.iter().all(|r| r.player != 3));
+        assert_eq!(
+            demo.saved
+                .receipts
+                .iter()
+                .find(|r| r.player == 1)
+                .unwrap()
+                .memo,
+            "Sats Melee — Blue team victory"
+        );
+        // A loser's damage earned just before the end remains a damage payout.
+        assert_eq!(
+            demo.saved
+                .receipts
+                .iter()
+                .find(|r| r.player == 0)
+                .unwrap()
+                .memo,
+            "Sats Melee — Damage payout"
+        );
         conserved(&demo);
     });
 }
@@ -517,7 +549,7 @@ fn activity_is_chronological_within_session_and_restart_starts_a_new_log() {
         let damage = lines.find("Player 1 received 8 sats • damage").unwrap();
         let winner = lines.find("Player 2 wins").unwrap();
         let settlement = lines
-            .find("Player 2 received 992 sats • settlement")
+            .find("Player 2 received 992 sats • match won")
             .unwrap();
         let next_invoice = lines.rfind("Player 1 Invoice Paid — 500 sats").unwrap();
         assert!(
