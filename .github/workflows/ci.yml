@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.88.0"
+          components: clippy
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  server:
+    name: sats-arena-server ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: sats-arena-server
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: sats-arena-server.exe
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            bin: sats-arena-server
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.88.0"
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --release -p sats-arena-server --target ${{ matrix.target }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sats-arena-server-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
