@@ -185,7 +185,7 @@ fn parse_invoice(value: &str) -> anyhow::Result<Bolt11Invoice> {
     Ok(invoice)
 }
 fn fee_sats(msats: u64) -> u64 {
-    msats / 1000 + u64::from(msats % 1000 != 0)
+    msats / 1000 + u64::from(!msats.is_multiple_of(1000))
 }
 fn settled(response: &LookupInvoiceResponse) -> bool {
     response.state == Some(TransactionState::Settled)

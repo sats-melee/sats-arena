@@ -236,11 +236,10 @@ impl Demo {
         }
         self.plan_payments()?;
         self.plan_entries();
-        if self.saved.pot.phase == Phase::Settled {
-            if let Some(roster) = self.saved.next_roster.clone() {
+        if self.saved.pot.phase == Phase::Settled
+            && let Some(roster) = self.saved.next_roster.clone() {
                 self.next_match(Some(roster)).await?;
             }
-        }
         // A failed request for an abandoned room must not leave a permanent
         // error on its replacement. Keep late-refund jobs across room changes.
         let mut current_keys = BTreeSet::new();
@@ -327,10 +326,11 @@ impl Demo {
             let index = self.retired_cursor % count;
             self.retired_cursor = (self.retired_cursor + 1) % count;
             let entry = &self.saved.retired_entries[index];
-            if entry.received_sats.is_none() && entry.state != PayoutState::Paid {
-                if self.plan_incoming(entry.incoming_hash.clone()) {
-                    self.io.retired_budget -= 1;
-                }
+            if entry.received_sats.is_none()
+                && entry.state != PayoutState::Paid
+                && self.plan_incoming(entry.incoming_hash.clone())
+            {
+                self.io.retired_budget -= 1;
             }
         }
     }
@@ -646,9 +646,8 @@ impl Demo {
             .retired_entries
             .iter_mut()
             .find(|e| e.incoming_hash == hash)
-        {
-            if entry.received_sats.is_none() && entry.state != PayoutState::Paid {
-                if let InvoiceState::Paid { amount_sats } = state {
+            && entry.received_sats.is_none() && entry.state != PayoutState::Paid
+                && let InvoiceState::Paid { amount_sats } = state {
                     entry.received_sats = Some(amount_sats);
                     let player = entry.player;
                     self.event(format!(
@@ -657,8 +656,6 @@ impl Demo {
                         amount_sats
                     ));
                 }
-            }
-        }
         Ok(())
     }
     fn apply_payment(&mut self, target: &Target, state: PaymentState) -> Result<()> {

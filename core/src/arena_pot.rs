@@ -133,7 +133,7 @@ impl MatchPot {
     }
 
     pub fn set_batch_window_ms(&mut self, milliseconds: u64) -> Result<()> {
-        if !(1_000..=120_000).contains(&milliseconds) || milliseconds % 1000 != 0 {
+        if !(1_000..=120_000).contains(&milliseconds) || !milliseconds.is_multiple_of(1000) {
             return Err(Error::Rejected(
                 "damage payout delay must be 1–120 whole seconds".into(),
             ));

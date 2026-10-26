@@ -67,15 +67,14 @@ fn cached<T: Clone>(cache: &Mutex<BTreeMap<String, Cached<T>>>, key: &str) -> Op
 fn remember<T>(cache: &Mutex<BTreeMap<String, Cached<T>>>, key: String, value: T, ttl: Duration) {
     let mut entries = cache.lock().unwrap();
     entries.retain(|_, entry| entry.until > Instant::now());
-    if entries.len() >= MAX_CACHED_HOSTS {
-        if let Some(oldest) = entries
+    if entries.len() >= MAX_CACHED_HOSTS
+        && let Some(oldest) = entries
             .iter()
             .min_by_key(|(_, entry)| entry.until)
             .map(|(key, _)| key.clone())
         {
             entries.remove(&oldest);
         }
-    }
     entries.insert(
         key,
         Cached {

@@ -415,11 +415,9 @@ impl State {
                 self.wallet.payment_state(&withdrawal.payment_hash),
             )
             .await
-            {
-                if let Err(error) = self.finish_withdrawal(&withdrawal.id, state) {
+                && let Err(error) = self.finish_withdrawal(&withdrawal.id, state) {
                     tracing::warn!("couldn't finish withdrawal {}: {error}", withdrawal.id);
                 }
-            }
         }
         Ok(())
     }
