@@ -27,8 +27,7 @@ async fn main() -> anyhow::Result<()> {
             == (InvoiceState::Paid { amount_sats: 1 })
         {
             println!(
-                "Sandbox NWC: invoice created, payment {:?}, incoming receipt confirmed",
-                payment
+                "Sandbox NWC: invoice created, payment {payment:?}, incoming receipt confirmed"
             );
             arena.shutdown().await;
             payer.shutdown().await;
