@@ -19,6 +19,14 @@ pub enum PayoutState {
     InFlight,
     Paid,
     Failed,
+    /// Never submitted; its funds are included in another payout instead.
+    Superseded,
+}
+
+impl PayoutState {
+    pub fn complete(self) -> bool {
+        matches!(self, Self::Paid | Self::Superseded)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -96,6 +96,50 @@ fn four_humans_all_require_current_verification_and_fresh_funding() {
 }
 
 #[test]
+fn financial_cpu_uses_normal_entry_admission_credits_and_confirmed_payouts() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut demo = Demo::open(dir.path()).await.unwrap();
+        let selected = roster(true, [1, 0, 3, 3], [0, 1, 255, 255]);
+        demo.saved
+            .pot
+            .configure(selected.teams, selected.kinds, selected.team_ids)
+            .unwrap();
+        demo.saved.roster = Some(selected);
+        demo.saved.pot.set_cpu_wallets(true).unwrap();
+        verify(&mut demo, 0).await;
+        verify(&mut demo, 1).await;
+        demo.command(Command::Action(2)).await.unwrap();
+        demo.reconcile().await.unwrap();
+        assert!(demo.command(Command::Action(4)).await.is_err());
+        demo.command(Command::Action(3)).await.unwrap();
+        demo.reconcile().await.unwrap();
+        demo.command(Command::Action(4)).await.unwrap();
+        assert_eq!(demo.view().unwrap().cpu_wallets, 1);
+        assert_eq!(demo.view().unwrap().kinds, [1, 0, 3, 3]);
+        demo.command(Command::Credits(vec![Credit {
+            sequence: 1,
+            attacker: 0,
+            victim: 1,
+            damage_centi: 1000,
+        }]))
+        .await
+        .unwrap();
+        assert_eq!(demo.saved.pot.pending(), [10, 0, 0, 0]);
+        demo.command(Command::Action(6)).await.unwrap();
+        demo.reconcile().await.unwrap();
+        assert_eq!(demo.saved.pot.earned, [1000, 0, 0, 0]);
+        assert_eq!(demo.saved.receipts.len(), 1);
+        assert_eq!(demo.saved.receipts[0].address, "player1@example.test");
+        conserved(&demo);
+        drop(demo);
+        let recovered = Demo::open(dir.path()).await.unwrap();
+        assert!(recovered.saved.pot.cpu_wallets);
+        assert_eq!(recovered.saved.pot.earned, [1000, 0, 0, 0]);
+    });
+}
+
+#[test]
 fn expired_or_incompatible_fourth_receiver_blocks_a_fully_paid_lobby() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
@@ -313,7 +357,7 @@ fn funded_roster_change_returns_entries_before_issuing_new_match_invoices() {
 }
 
 #[test]
-fn unresolved_return_does_not_enable_or_refund_a_new_roster_twice() {
+fn unresolved_return_recovers_without_blocking_or_funding_a_new_roster() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
         let mut demo = Demo::open(dir.path()).await.unwrap();
@@ -341,16 +385,19 @@ fn unresolved_return_does_not_enable_or_refund_a_new_roster_twice() {
         drop(demo);
         let mut demo = Demo::open(dir.path()).await.unwrap();
         demo.reconcile().await.unwrap(); // Fake wallet cannot know this interrupted payment's result.
-        assert_eq!(demo.saved.pot.id, old_id);
-        assert_eq!(demo.saved.pot.phase, Phase::Settling);
-        assert_eq!(demo.saved.next_roster, Some(teams()));
+        assert_ne!(demo.saved.pot.id, old_id);
+        assert_eq!(demo.saved.pot.phase, Phase::Funding);
+        assert_eq!(demo.saved.roster, Some(teams()));
+        assert_eq!(demo.saved.pending_matches[0].pot.id, old_id);
+        assert_eq!(demo.saved.pending_matches[0].pot.phase, Phase::Settling);
         assert_eq!(demo.simulation.as_ref().unwrap().payment_attempts(), 0);
         assert!(demo.command(Command::Action(4)).await.is_err());
         let changed = roster(true, [0; 4], [0, 0, 1, 1]);
         demo.command(Command::Roster(changed.clone()))
             .await
             .unwrap();
-        assert_eq!(demo.saved.pot.id, old_id);
+        assert_ne!(demo.saved.pot.id, old_id);
+        assert_eq!(demo.saved.pending_matches.len(), 1);
         demo.simulation
             .as_ref()
             .unwrap()
@@ -360,6 +407,7 @@ fn unresolved_return_does_not_enable_or_refund_a_new_roster_twice() {
         assert_eq!(demo.saved.roster, Some(changed));
         assert_eq!(demo.saved.pot.paid, [false; 4]);
         assert_eq!(demo.saved.receipts.len(), 1);
+        assert!(demo.saved.pending_matches.is_empty());
         assert_eq!(demo.simulation.as_ref().unwrap().payment_attempts(), 0);
         conserved(&demo);
     });
@@ -489,7 +537,7 @@ fn schema_two_migration_preserves_two_player_funds_payout_ids_and_fractional_dam
         .unwrap();
         drop(original);
         let mut migrated = Demo::open(dir.path()).await.unwrap();
-        assert_eq!(migrated.saved.schema, 3);
+        assert_eq!(migrated.saved.schema, 4);
         assert_eq!(migrated.saved.pot.id, old_id);
         assert_eq!(migrated.saved.pot.kinds, [0, 0, 3, 3]);
         assert_eq!(migrated.saved.pot.paid, [true, true, false, false]);

@@ -82,9 +82,10 @@ When resolving the recipient's Lightning Address, the LNURL provider sends the
 label as a LUD-12 `comment` only if `commentAllowed` is positive. It respects
 the provider's character limit and the callback URL size, using proper URL
 encoding. Providers without comments continue to receive payments normally.
-Invoice signatures, amount and expiry remain checked. Hashed descriptions must
-match the receiving metadata; signed text descriptions must match its text or
-the exact comment actually sent (including any length truncation).
+Invoice signatures, amount and expiry remain checked. Matching description
+hashes/text are recorded when available. Forwarding services whose upstream
+wallet uses different descriptions remain bound to their validated HTTPS
+callback; the report distinguishes this from a matching metadata commitment.
 
 The full label is saved with the prepared invoice before payment and copied
 to the confirmed receipt. Recovery reuses that invoice and label; older prepared
@@ -117,6 +118,14 @@ unknown/lost responses remain pending and recovered intents are looked up rather
 than sent again. Ambiguous outcomes never release funds for a replacement payout.
 
 ## State and late payments
+
+After the game ends, unresolved payouts move into durable `pending_matches`
+snapshots. A new game requires fresh entries and can proceed while those earlier
+payouts recover. Each snapshot keeps the original pot, recipients, invoices and
+receipts. InFlight payments are looked up by their original hash, never resent
+because of a timeout. Failed or unknown payouts keep their reserved amount and
+remain visible without blocking the current match. Settled recovery snapshots
+are archived only after their receipts have been persisted.
 
 Default paths are `<Dolphin user>/SatsArenaFake/` and
 `<Dolphin user>/SatsArenaLive/<public-connection-fingerprint>/`.

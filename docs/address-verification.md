@@ -13,12 +13,23 @@ For each address, the background worker:
 3. Requests a minimum whole-satoshi **unpaid test invoice**.
 4. Parses BOLT11, checks its signature, exact amount, Bitcoin mainnet currency,
    creation time and at least 30 seconds of remaining validity.
-5. Checks that a description hash commits to the raw LNURL metadata, or that a
-   directly signed description exactly matches its advertised text/plain value.
+5. Records whether the signed description matches the advertised metadata.
+   Forwarding addresses may use an upstream wallet's different description;
+   those invoices are bound to the validated HTTPS callback instead. Signature,
+   exact amount, mainnet currency and expiry checks still apply to every invoice.
 
 No payment is sent. Verification does not establish ownership of the address,
 prove successful routing, or guarantee that a later payment will succeed.
 Each eventual payout requests and validates a fresh invoice.
+
+Receiving checks run independently on background jobs, with a 15-second overall
+deadline. Editing an address cancels its old check. A failed receiver does not
+hold other players' edits, receipt polling or the accounting coordinator.
+
+On 2026-10-27, `nic@lawallet.io` and `agustin@lacrypta.ar` both returned signed
+1-sat unpaid mainnet invoices and verified in the actual native UI. Both use
+descriptions different from their public forwarding metadata, so their reports
+record `https_callback` rather than claiming a matching metadata commitment.
 
 A red message at the top blocks match start until every current human address is
 verified. Editing one address invalidates only its displayed verification.

@@ -4,6 +4,7 @@
 //! finalized game order: that order determines who can steal the last sats from
 //! an exhausted victim. No balance can be spent beyond its original entry.
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::{
     Error, Result,
@@ -55,6 +56,12 @@ pub struct MatchPot {
     pub team_ids: [u8; PLAYERS],
     #[serde(default)]
     pub teams: bool,
+    /// Developer option, frozen before funding. Control kind remains CPU.
+    #[serde(default)]
+    pub cpu_wallets: bool,
+    /// Audit trail for unsent payments absorbed by a newer payment.
+    #[serde(default)]
+    pub payout_replacements: BTreeMap<String, String>,
     #[serde(default)]
     pub last_credit_sequence: u64,
     /// Fractional sats are carried independently for each attacker/victim pair.
@@ -100,6 +107,8 @@ impl MatchPot {
             kinds: default_kinds(),
             team_ids: default_teams(),
             teams: false,
+            cpu_wallets: false,
+            payout_replacements: BTreeMap::new(),
             last_credit_sequence: 0,
             fractional_sats: [[0; PLAYERS]; PLAYERS],
         })
@@ -107,6 +116,24 @@ impl MatchPot {
 
     pub fn surcharge_sats(&self) -> u64 {
         (u128::from(self.entry_sats) * u128::from(self.surcharge_bps)).div_ceil(10_000) as u64
+    }
+    pub fn participates(&self, player: usize) -> bool {
+        player < PLAYERS
+            && (self.kinds[player] == HUMAN || (self.cpu_wallets && self.kinds[player] == CPU))
+    }
+
+    pub fn set_cpu_wallets(&mut self, enabled: bool) -> Result<()> {
+        if !matches!(self.phase, Phase::Funding | Phase::Ready)
+            || self.paid.iter().any(|&paid| paid)
+        {
+            return Err(Error::Rejected(
+                "funded match CPU wallets are locked".into(),
+            ));
+        }
+        self.cpu_wallets = enabled;
+        self.phase = Phase::Funding;
+        self.update_funding_phase();
+        Ok(())
     }
     pub fn invoice_sats(&self) -> u64 {
         self.entry_sats + self.surcharge_sats()
@@ -192,7 +219,7 @@ impl MatchPot {
 
     /// The wallet has confirmed this current-match invoice's exact entry amount.
     pub fn confirm_entry(&mut self, player: usize, sats: u64) -> Result<()> {
-        if player >= PLAYERS || self.kinds[player] != HUMAN || sats != self.invoice_sats() {
+        if !self.participates(player) || sats != self.invoice_sats() {
             return Err(Error::Rejected("incorrect entry payment".into()));
         }
         if self.paid[player] {
@@ -214,7 +241,7 @@ impl MatchPot {
             .kinds
             .iter()
             .enumerate()
-            .all(|(i, &kind)| kind != HUMAN || self.paid[i])
+            .all(|(i, _)| !self.participates(i) || self.paid[i])
         {
             self.phase = Phase::Ready;
         }
@@ -226,10 +253,10 @@ impl MatchPot {
                 .kinds
                 .iter()
                 .enumerate()
-                .any(|(i, &kind)| kind == HUMAN && !self.paid[i])
+                .any(|(i, _)| self.participates(i) && !self.paid[i])
         {
             return Err(Error::Rejected(
-                "all human entry invoices must be paid".into(),
+                "all participating player entry invoices must be paid".into(),
             ));
         }
         self.phase = Phase::Playing;
@@ -275,8 +302,8 @@ impl MatchPot {
             self.damage_centi[victim] =
                 self.damage_centi[victim].saturating_add(credit.damage_centi);
             if attacker == victim
-                || self.kinds[attacker] != HUMAN
-                || self.kinds[victim] != HUMAN
+                || !self.participates(attacker)
+                || !self.participates(victim)
                 || (self.teams && self.team_ids[attacker] == self.team_ids[victim])
             {
                 continue;
@@ -383,7 +410,7 @@ impl MatchPot {
         let mut final_sats = std::mem::take(&mut self.unbatched);
         self.batch_deadline_ms = [None; PLAYERS];
         let winners: Vec<usize> = (0..PLAYERS)
-            .filter(|&i| self.kinds[i] == HUMAN && winner.is_some_and(|w| self.same_side(i, w)))
+            .filter(|&i| self.participates(i) && winner.is_some_and(|w| self.same_side(i, w)))
             .collect();
         if winners.is_empty() {
             for player in 0..PLAYERS {
@@ -413,6 +440,39 @@ impl MatchPot {
         Ok(())
     }
 
+    /// Hosts call this only before dispatch. InFlight/Failed/Paid intents retain
+    /// their amount and identity. Superseded records remain available for audit.
+    pub fn consolidate_created(&mut self) -> bool {
+        let mut changed = false;
+        for player in 0..PLAYERS {
+            let indices: Vec<_> = self
+                .payouts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.player == player && p.state == PayoutState::Created)
+                .map(|(i, _)| i)
+                .collect();
+            if indices.len() < 2 {
+                continue;
+            }
+            let sats = indices.iter().map(|&i| self.payouts[i].sats).sum();
+            let reason = if self.phase == Phase::Settling {
+                Reason::Settlement
+            } else {
+                Reason::Damage
+            };
+            self.payout(player, sats, reason);
+            let replacement = self.payouts.last().unwrap().id.clone();
+            for i in indices {
+                self.payouts[i].state = PayoutState::Superseded;
+                self.payout_replacements
+                    .insert(self.payouts[i].id.clone(), replacement.clone());
+            }
+            changed = true;
+        }
+        changed
+    }
+
     pub fn begin_payout(&mut self, index: usize) -> Result<()> {
         let payout = self.payouts.get_mut(index).ok_or(Error::NotFound)?;
         if payout.state != PayoutState::Created {
@@ -439,7 +499,7 @@ impl MatchPot {
     pub fn pending(&self) -> [u64; PLAYERS] {
         let mut pending = self.unbatched;
         for payout in &self.payouts {
-            if payout.state != PayoutState::Paid {
+            if !payout.state.complete() {
                 pending[payout.player] += payout.sats;
             }
         }
@@ -447,9 +507,7 @@ impl MatchPot {
     }
 
     fn update_phase(&mut self) {
-        if self.phase == Phase::Settling
-            && self.payouts.iter().all(|p| p.state == PayoutState::Paid)
-        {
+        if self.phase == Phase::Settling && self.payouts.iter().all(|p| p.state.complete()) {
             self.phase = Phase::Settled;
         }
     }
@@ -472,7 +530,7 @@ mod tests {
     }
     fn fund(pot: &mut MatchPot) {
         for player in 0..PLAYERS {
-            if pot.kinds[player] == HUMAN {
+            if pot.participates(player) {
                 assert!(pot.start().is_err());
                 pot.confirm_entry(player, pot.entry_sats).unwrap();
                 conserved(pot);
@@ -493,9 +551,9 @@ mod tests {
                 .iter()
                 .all(|&remaining| remaining <= pot.entry_sats)
         );
-        assert!(pot.payouts.iter().all(|p| pot.kinds[p.player] == HUMAN));
+        assert!(pot.payouts.iter().all(|p| pot.participates(p.player)));
         for player in 0..PLAYERS {
-            if pot.kinds[player] != HUMAN {
+            if !pot.participates(player) {
                 assert_eq!(
                     (
                         pot.paid[player],
@@ -858,5 +916,62 @@ mod tests {
         let mut huge = MatchPot::new("limit".into(), MAX_BALANCE_SATS / 4, 1).unwrap();
         assert!(huge.set_surcharge_bps(1).is_err());
         assert!(p.set_surcharge_bps(10_001).is_err());
+    }
+
+    #[test]
+    fn cpu_wallets_require_funding_and_share_the_same_damage_and_winning_rules() {
+        let mut p = MatchPot::new("cpu-wallets".into(), 500, 1).unwrap();
+        p.configure(false, [CPU, HUMAN, CLOSED, CLOSED], [NO_TEAM; 4])
+            .unwrap();
+        assert!(p.confirm_entry(0, 500).is_err());
+        p.set_cpu_wallets(true).unwrap();
+        fund(&mut p);
+        assert!(p.set_cpu_wallets(false).is_err());
+        credit(&mut p, 0, 1, 10_000, 0);
+        credit(&mut p, 1, 0, 2_500, 0);
+        p.finish(Some(0)).unwrap();
+        p.consolidate_created();
+        pay(&mut p);
+        assert_eq!(p.earned, [975, 25, 0, 0]);
+        let recovered: MatchPot = serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
+        assert!(recovered.cpu_wallets);
+        assert_eq!(recovered.kinds, [CPU, HUMAN, CLOSED, CLOSED]);
+        conserved(&recovered);
+    }
+
+    #[test]
+    fn final_consolidation_replaces_only_never_submitted_intents_and_conserves_funds() {
+        let mut p = MatchPot::new("final-consolidation".into(), 500, 1).unwrap();
+        p.configure(false, [HUMAN; 4], [NO_TEAM; 4]).unwrap();
+        fund(&mut p);
+        credit(&mut p, 0, 1, 1_000, 0);
+        p.flush_due(5_000);
+        p.begin_payout(0).unwrap();
+        let submitted = p.payouts[0].clone();
+        credit(&mut p, 0, 1, 2_000, 6_000);
+        p.flush_due(11_000);
+        credit(&mut p, 0, 1, 3_000, 12_000);
+        p.flush_due(17_000);
+        p.finish(Some(0)).unwrap();
+        assert!(p.consolidate_created());
+        assert_eq!(p.payouts[0], submitted);
+        assert_eq!(p.pending(), [2000, 0, 0, 0]);
+        assert_eq!(p.payout_replacements.len(), 3);
+        let replacement = p.payouts.last().unwrap();
+        assert_eq!(replacement.sats, 1990);
+        assert_eq!(replacement.reason, Reason::Settlement);
+        for original in &p.payouts[1..4] {
+            assert_eq!(original.state, PayoutState::Superseded);
+            assert_eq!(p.payout_replacements[&original.id], replacement.id);
+        }
+        let serialized = serde_json::to_value(&p).unwrap();
+        p.finish(Some(0)).unwrap();
+        assert!(!p.consolidate_created());
+        assert_eq!(serde_json::to_value(&p).unwrap(), serialized);
+        p.confirm_payout(0).unwrap();
+        pay(&mut p);
+        assert_eq!(p.earned, [2000, 0, 0, 0]);
+        assert_eq!(p.phase, Phase::Settled);
+        conserved(&p);
     }
 }

@@ -4,8 +4,8 @@
 use super::{DecodedInvoice, InvoiceState, NewInvoice, PaymentState, Wallet};
 use ::nwc::NostrWalletConnect;
 use ::nwc::prelude::{
-    Keys, LookupInvoiceRequest, LookupInvoiceResponse, MakeInvoiceRequest, Method,
-    NostrWalletConnectUri, PayInvoiceRequest, TransactionState, TransactionType,
+    Keys, ListTransactionsRequest, LookupInvoiceRequest, LookupInvoiceResponse, MakeInvoiceRequest,
+    Method, NostrWalletConnectUri, PayInvoiceRequest, TransactionState, TransactionType,
 };
 use anyhow::{anyhow, ensure};
 use async_trait::async_trait;
@@ -24,7 +24,26 @@ pub struct NwcWallet {
     client: NostrWalletConnect,
     identity: String,
     timeout: Duration,
+    can_list_transactions: bool,
 }
+
+/// Fixed, credential-free explanations that the local UI may show directly.
+#[derive(Debug)]
+pub enum IncomingReceiptError {
+    HistoryPermission,
+    HistoryUnavailable,
+    ReceiptNotFound,
+}
+impl std::fmt::Display for IncomingReceiptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::HistoryPermission => "This self-payment needs list_transactions permission on the host NWC connection to confirm its incoming receipt. Do not pay again.",
+            Self::HistoryUnavailable => "Could not read the incoming receipt for this self-payment. Check list_transactions access on the host NWC connection; retrying. Do not pay again.",
+            Self::ReceiptNotFound => "The wallet returned the outgoing side of this self-payment; its matching incoming receipt is not visible yet. Retrying. Do not pay again.",
+        })
+    }
+}
+impl std::error::Error for IncomingReceiptError {}
 impl NwcWallet {
     /// Validate permissions and establish the encrypted NWC connection without
     /// creating invoices, sending funds, or disclosing wallet/provider errors.
@@ -109,6 +128,7 @@ impl NwcWallet {
             client,
             identity,
             timeout,
+            can_list_transactions: info.methods.contains(&Method::ListTransactions),
         })
     }
     /// Fingerprint of public connection identities and relay URLs, never the URI.
@@ -131,15 +151,62 @@ impl NwcWallet {
         .await
         .map_err(|_| anyhow!("NWC lookup timed out"))?
         .map_err(|_| anyhow!("NWC lookup unavailable"))?;
-        ensure!(
-            normalized_hash(&response.payment_hash)? == hash,
-            "NWC returned a different payment hash"
-        );
-        if let Some(preimage) = &response.preimage {
-            verify_preimage(preimage, &hash)?;
-        }
-        Ok(response)
+        checked_lookup(response, &hash)
     }
+
+    async fn incoming_receipt(&self, payment_hash: &str) -> anyhow::Result<LookupInvoiceResponse> {
+        if !self.can_list_transactions {
+            return Err(IncomingReceiptError::HistoryPermission.into());
+        }
+        let hash = normalized_hash(payment_hash)?;
+        // Alby can return the newer outgoing record for a payment to the same wallet.
+        // Only a separate matching incoming receipt may authorize entry credit.
+        for page in 0..4 {
+            let request = ListTransactionsRequest {
+                transaction_type: Some(TransactionType::Incoming),
+                unpaid: Some(true),
+                limit: Some(50),
+                offset: Some(page * 50),
+                ..Default::default()
+            };
+            let receipts = tokio::time::timeout(self.timeout, async {
+                self.client.list_transactions(request).await
+            })
+            .await
+            .map_err(|_| IncomingReceiptError::HistoryUnavailable)?
+            .map_err(|_| IncomingReceiptError::HistoryUnavailable)?;
+            let count = receipts.len();
+            for receipt in receipts {
+                if receipt.transaction_type == Some(TransactionType::Incoming)
+                    && normalized_hash(&receipt.payment_hash).ok().as_deref() == Some(hash.as_str())
+                {
+                    return checked_lookup(receipt, &hash);
+                }
+            }
+            if count < 50 {
+                break;
+            }
+        }
+        Err(IncomingReceiptError::ReceiptNotFound.into())
+    }
+}
+
+fn checked_lookup(
+    response: LookupInvoiceResponse,
+    hash: &str,
+) -> anyhow::Result<LookupInvoiceResponse> {
+    ensure!(
+        normalized_hash(&response.payment_hash)? == hash,
+        "NWC returned a different payment hash"
+    );
+    // Some wallets include an empty/placeholder preimage on unpaid invoices.
+    // It is not a payment proof until the wallet reports settlement.
+    if settled(&response) {
+        if let Some(preimage) = &response.preimage {
+            verify_preimage(preimage, hash)?;
+        }
+    }
+    Ok(response)
 }
 fn normalized_hash(value: &str) -> anyhow::Result<String> {
     let bytes = hex::decode(value).map_err(|_| anyhow!("invalid payment hash"))?;
@@ -240,7 +307,10 @@ impl Wallet for NwcWallet {
         })
     }
     async fn invoice_state(&self, payment_hash: &str) -> anyhow::Result<InvoiceState> {
-        let response = self.lookup(payment_hash).await?;
+        let mut response = self.lookup(payment_hash).await?;
+        if response.transaction_type == Some(TransactionType::Outgoing) {
+            response = self.incoming_receipt(payment_hash).await?;
+        }
         ensure!(
             response.transaction_type == Some(TransactionType::Incoming),
             "NWC lookup did not identify an incoming invoice"
@@ -312,13 +382,13 @@ impl Wallet for NwcWallet {
         }
     }
     async fn payment_state(&self, payment_hash: &str) -> anyhow::Result<PaymentState> {
-        let response = match self.lookup(payment_hash).await {
-            Ok(response) => response,
-            Err(_) => return Ok(PaymentState::Pending),
-        };
-        if response.transaction_type != Some(TransactionType::Outgoing) {
-            return Ok(PaymentState::Pending);
-        }
+        // An unavailable lookup is an unknown outcome, but is not evidence
+        // that the provider actually reports an in-flight transaction.
+        let response = self.lookup(payment_hash).await?;
+        ensure!(
+            response.transaction_type == Some(TransactionType::Outgoing),
+            "NWC lookup did not identify an outgoing payment"
+        );
         if settled(&response) {
             Ok(PaymentState::Succeeded {
                 fee_sats: fee_sats(response.fees_paid),
@@ -350,8 +420,12 @@ mod tests {
     struct State {
         requests: Vec<String>,
         incoming_paid: bool,
+        incoming_preimage: Option<String>,
         incoming_expired: bool,
         legacy_expiry: bool,
+        self_payment: bool,
+        history: Vec<Value>,
+        history_error: bool,
         outgoing: String,
         wrong_proof: bool,
         omit_pay_response: bool,
@@ -459,11 +533,22 @@ mod tests {
                             "lookup_invoice" => {
                                 let hash = request["params"]["payment_hash"].as_str().unwrap();
                                 if hash == in_hash {
-                                    json!({"type":"incoming","state":if state.incoming_paid {Some("settled")} else if state.incoming_expired {Some("expired")} else if state.legacy_expiry {None} else {Some("pending")},"expires_at":if state.legacy_expiry {Some(1)} else {None},"payment_hash":in_hash,"amount":500000,"fees_paid":0,"created_at":1,"settled_at":if state.incoming_paid {Some(2)} else {None}})
+                                    json!({"type":if state.self_payment {"outgoing"} else {"incoming"},"state":if state.incoming_paid {Some("settled")} else if state.incoming_expired {Some("expired")} else if state.legacy_expiry {None} else {Some("pending")},"expires_at":if state.legacy_expiry {Some(1)} else {None},"payment_hash":in_hash,"preimage":state.incoming_preimage,"amount":500000,"fees_paid":0,"created_at":1,"settled_at":if state.incoming_paid {Some(2)} else {None}})
                                 } else if hash == out_hash {
                                     json!({"type":"outgoing","state":if state.outgoing.is_empty() {"pending"} else {&state.outgoing},"payment_hash":out_hash,"preimage":if state.outgoing=="settled" {Some(hex::encode([8;32]))} else {None},"amount":8000,"fees_paid":1500,"created_at":1,"settled_at":if state.outgoing=="settled" {Some(2)} else {None}})
                                 } else {
                                     json!({"_lookup_error":true})
+                                }
+                            }
+                            "list_transactions" => {
+                                assert_eq!(request["params"]["type"], "incoming");
+                                assert_eq!(request["params"]["unpaid"], true);
+                                assert_eq!(request["params"]["limit"], 50);
+                                let offset = request["params"]["offset"].as_u64().unwrap() as usize;
+                                if state.history_error {
+                                    json!({"_lookup_error":true})
+                                } else {
+                                    json!({"transactions":state.history.iter().skip(offset).take(50).collect::<Vec<_>>()})
                                 }
                             }
                             "pay_invoice" => {
@@ -512,6 +597,181 @@ mod tests {
     }
     const METHODS: &[&str] = &["get_info", "make_invoice", "lookup_invoice", "pay_invoice"];
 
+    fn receipt() -> Value {
+        json!({"type":"incoming","state":"settled","payment_hash":hex::encode(Sha256::digest([7;32])),"preimage":hex::encode([7;32]),"amount":500000,"fees_paid":0,"created_at":1,"settled_at":2})
+    }
+
+    async fn self_payment_service() -> Service {
+        let mut methods = METHODS.to_vec();
+        methods.push("list_transactions");
+        let service = Service::start(Nip47Ciphers::NIP44V2, &methods, "bitcoin").await;
+        {
+            let mut state = service.state.lock().unwrap();
+            state.self_payment = true;
+            state.incoming_paid = true;
+            state.incoming_preimage = Some(hex::encode([7; 32]));
+        }
+        service
+    }
+
+    #[tokio::test]
+    async fn self_payment_requires_a_matching_incoming_receipt_and_paginates() {
+        let service = self_payment_service().await;
+        let wallet = NwcWallet::connect(&service.uri).await.unwrap();
+        let hash = wallet
+            .decode_invoice(&service.incoming)
+            .unwrap()
+            .payment_hash;
+        let mut unrelated = receipt();
+        unrelated["payment_hash"] = json!("aa".repeat(32));
+        let mut outgoing = receipt();
+        outgoing["type"] = json!("outgoing");
+        {
+            let mut state = service.state.lock().unwrap();
+            state.history = vec![unrelated; 50];
+            state.history.push(outgoing);
+        }
+        let error = wallet.invoice_state(&hash).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(IncomingReceiptError::ReceiptNotFound)
+        ));
+        service.state.lock().unwrap().history.push(receipt());
+        assert_eq!(
+            wallet.invoice_state(&hash).await.unwrap(),
+            InvoiceState::Paid { amount_sats: 500 }
+        );
+        assert_eq!(
+            service.state.lock().unwrap().requests,
+            [
+                "get_info",
+                "lookup_invoice",
+                "list_transactions",
+                "list_transactions",
+                "lookup_invoice",
+                "list_transactions",
+                "list_transactions"
+            ]
+        );
+        wallet.shutdown().await;
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn self_payment_history_enforces_settlement_proof_and_amount() {
+        let service = self_payment_service().await;
+        let wallet = NwcWallet::connect(&service.uri).await.unwrap();
+        let hash = wallet
+            .decode_invoice(&service.incoming)
+            .unwrap()
+            .payment_hash;
+        let mut pending = receipt();
+        pending["state"] = json!("pending");
+        pending["settled_at"] = Value::Null;
+        pending["preimage"] = json!("");
+        service.state.lock().unwrap().history = vec![pending];
+        assert_eq!(
+            wallet.invoice_state(&hash).await.unwrap(),
+            InvoiceState::Pending
+        );
+        let mut invalid = receipt();
+        invalid["preimage"] = json!("00".repeat(32));
+        service.state.lock().unwrap().history = vec![invalid];
+        assert!(wallet.invoice_state(&hash).await.is_err());
+        for amount in [0, 500001] {
+            let mut invalid = receipt();
+            invalid["amount"] = json!(amount);
+            service.state.lock().unwrap().history = vec![invalid];
+            assert!(wallet.invoice_state(&hash).await.is_err());
+        }
+        service.state.lock().unwrap().history_error = true;
+        let error = wallet.invoice_state(&hash).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(IncomingReceiptError::HistoryUnavailable)
+        ));
+        assert!(!error.to_string().contains("secret-must-not-leak"));
+        wallet.shutdown().await;
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn self_payment_missing_permission_has_an_actionable_error() {
+        let service = Service::start(Nip47Ciphers::NIP44V2, METHODS, "bitcoin").await;
+        service.state.lock().unwrap().self_payment = true;
+        let wallet = NwcWallet::connect(&service.uri).await.unwrap();
+        let hash = wallet
+            .decode_invoice(&service.incoming)
+            .unwrap()
+            .payment_hash;
+        let error = wallet.invoice_state(&hash).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(IncomingReceiptError::HistoryPermission)
+        ));
+        assert!(error.to_string().contains("list_transactions permission"));
+        assert_eq!(
+            service.state.lock().unwrap().requests,
+            ["get_info", "lookup_invoice"]
+        );
+        wallet.shutdown().await;
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn self_payment_history_search_is_bounded() {
+        let service = self_payment_service().await;
+        let wallet = NwcWallet::connect(&service.uri).await.unwrap();
+        let hash = wallet
+            .decode_invoice(&service.incoming)
+            .unwrap()
+            .payment_hash;
+        let mut unrelated = receipt();
+        unrelated["payment_hash"] = json!("aa".repeat(32));
+        service.state.lock().unwrap().history = vec![unrelated; 250];
+        assert!(wallet.invoice_state(&hash).await.is_err());
+        assert_eq!(
+            service
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|m| *m == "list_transactions")
+                .count(),
+            4
+        );
+        wallet.shutdown().await;
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pending_invoice_placeholder_proofs_do_not_block_confirmation() {
+        let service = Service::start(Nip47Ciphers::NIP44V2, METHODS, "bitcoin").await;
+        let wallet = NwcWallet::connect(&service.uri).await.unwrap();
+        let hash = wallet
+            .decode_invoice(&service.incoming)
+            .unwrap()
+            .payment_hash;
+        for proof in [String::new(), "00".repeat(32)] {
+            service.state.lock().unwrap().incoming_preimage = Some(proof);
+            assert_eq!(
+                wallet.invoice_state(&hash).await.unwrap(),
+                InvoiceState::Pending
+            );
+        }
+        service.state.lock().unwrap().incoming_paid = true;
+        // A placeholder must never authorize credit once the wallet claims settlement.
+        assert!(wallet.invoice_state(&hash).await.is_err());
+        service.state.lock().unwrap().incoming_preimage = Some(hex::encode([7; 32]));
+        assert_eq!(
+            wallet.invoice_state(&hash).await.unwrap(),
+            InvoiceState::Paid { amount_sats: 500 }
+        );
+        wallet.shutdown().await;
+        service.stop().await;
+    }
+
     #[tokio::test]
     async fn encrypted_relay_exercises_entry_confirmation_payout_and_lookup() {
         let service = Service::start(Nip47Ciphers::NIP44V2, METHODS, "bitcoin").await;
@@ -558,10 +818,7 @@ mod tests {
             wallet.payment_state(&hash).await.unwrap(),
             PaymentState::Succeeded { fee_sats: 2 }
         );
-        assert_eq!(
-            wallet.payment_state(&"aa".repeat(32)).await.unwrap(),
-            PaymentState::Pending
-        );
+        assert!(wallet.payment_state(&"aa".repeat(32)).await.is_err());
         assert_eq!(
             service
                 .state

@@ -26,8 +26,11 @@ typedef struct ArenaLocalView {
     uint32_t surcharge_bps;
     uint64_t invoice_sats, surcharge_sats, collected_fee_sats;
     char payment_error[256];
+    uint32_t cpu_wallets;
+    uint64_t background_pending_sats, background_failed_sats;
 } ArenaLocalView;
-/* ABI 8. Fresh entry invoices for every participating human. No reusable account balance.
+/* ABI 10. Background payouts are informational and never gate the current match.
+ * Fresh entry invoices for each financial participant, including opted-in CPUs.
  * Phase: 0 loading, 1 awaiting entry, 2 paid, 3 playing, 4 paid out,
  * 6 payouts pending, 7 error.
  * Actions: 1 next match, 2/3 pay sandbox entry (or simulate in unit-test fake mode) P1/P2, 4 start,
@@ -41,6 +44,14 @@ ArenaLocalHandle* arena_local_create(const char* folder);
 /* Separate fake/live roots; live state is additionally bound to wallet identity. */
 ArenaLocalHandle* arena_local_create_configured(const char* fake_folder, const char* live_folder);
 bool arena_local_snapshot(const ArenaLocalHandle*, ArenaLocalView* out);
+/* Read-only optional diagnostics; does not change funding, admission, or payments.
+ * Disabled by default. Contains all local archived/current/recovering payouts,
+ * open damage batches and received late-entry returns, including paid/failed items.
+ * Snapshot returns required UTF-8 bytes INCLUDING the terminating NUL, or 0 if
+ * disabled/unavailable. NULL/0 queries the size. An undersized buffer is left
+ * untouched; resize and retry. No invoices or wallet credentials are included. */
+bool arena_local_outbound_debug(const ArenaLocalHandle*, bool enabled);
+uint32_t arena_local_outbound_snapshot(const ArenaLocalHandle*, char* out, uint32_t size);
 bool arena_local_action(const ArenaLocalHandle*, uint32_t action);
 bool arena_local_credit(const ArenaLocalHandle*, uint64_t p1_damage_centi, uint64_t p2_damage_centi);
 bool arena_local_addresses(const ArenaLocalHandle*, const char* p1, const char* p2);

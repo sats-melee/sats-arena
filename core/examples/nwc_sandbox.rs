@@ -1,5 +1,7 @@
 //! Opt-in real NWC sandbox round trip. Credentials arrive on stdin, never argv.
-use sats_arena_core::wallet::{InvoiceState, NWC_WALLET_MANAGED_FEES, NwcWallet, Wallet};
+use sats_arena_core::wallet::{
+    InvoiceState, NWC_WALLET_MANAGED_FEES, NewInvoice, NwcWallet, Wallet,
+};
 use serde::Deserialize;
 use std::io::{self, Read};
 
@@ -7,6 +9,8 @@ use std::io::{self, Read};
 struct Config {
     arena_uri: String,
     payer_uri: String,
+    /// Optional invoice issued by the isolated native sandbox for admission checks.
+    invoice: Option<String>,
 }
 
 #[tokio::main]
@@ -16,15 +20,29 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = serde_json::from_str(&input)?;
     let arena = NwcWallet::connect(&config.arena_uri).await?;
     let payer = NwcWallet::connect(&config.payer_uri).await?;
-    let invoice = arena
-        .create_invoice(1, "Arena sandbox NWC check", 600)
-        .await?;
+    let invoice = if let Some(bolt11) = config.invoice {
+        let decoded = arena.decode_invoice(&bolt11)?;
+        NewInvoice {
+            bolt11,
+            payment_hash: decoded.payment_hash,
+        }
+    } else {
+        arena
+            .create_invoice(1, "Arena sandbox NWC check", 600)
+            .await?
+    };
+    let expected_sats = arena
+        .decode_invoice(&invoice.bolt11)?
+        .amount_sats
+        .ok_or_else(|| anyhow::anyhow!("Sandbox invoice has no amount"))?;
     let payment = payer
         .pay_invoice(&invoice.bolt11, NWC_WALLET_MANAGED_FEES)
         .await?;
     for _ in 0..30 {
         if arena.invoice_state(&invoice.payment_hash).await?
-            == (InvoiceState::Paid { amount_sats: 1 })
+            == (InvoiceState::Paid {
+                amount_sats: expected_sats,
+            })
         {
             println!(
                 "Sandbox NWC: invoice created, payment {payment:?}, incoming receipt confirmed"

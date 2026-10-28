@@ -1,6 +1,7 @@
 //! Wallet-neutral local host for up to four funded humans and CPU participants.
 //! Simulated wallet, live receiving verification, ordered damage and team settlement.
 mod config;
+mod outbound_debug;
 mod payment_io;
 mod wallet_check;
 
@@ -67,11 +68,14 @@ pub struct LocalView {
     pub surcharge_sats: u64,
     pub collected_fee_sats: u64,
     pub payment_error: [u8; 256],
+    pub cpu_wallets: u32,
+    pub background_pending_sats: u64,
+    pub background_failed_sats: u64,
 }
 impl Default for LocalView {
     fn default() -> Self {
         Self {
-            abi_version: 8,
+            abi_version: 10,
             phase: 0,
             busy: 1,
             simulated: 1,
@@ -105,6 +109,9 @@ impl Default for LocalView {
             surcharge_sats: 0,
             collected_fee_sats: 0,
             payment_error: [0; 256],
+            cpu_wallets: 0,
+            background_pending_sats: 0,
+            background_failed_sats: 0,
         }
     }
 }
@@ -125,7 +132,7 @@ struct Roster {
     team_ids: [u8; 4],
     characters: [u8; 4],
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     schema: u32,
     #[serde(default)]
@@ -134,6 +141,10 @@ struct Saved {
     invoice_addresses: [String; 4],
     #[serde(default)]
     retired_entries: Vec<RetiredEntry>,
+    // Completed games keep their own immutable recipients, invoices and pots
+    // while unresolved payouts recover independently of the playable match.
+    #[serde(default)]
+    pending_matches: Vec<Saved>,
     #[serde(default)]
     roster: Option<Roster>,
     #[serde(default)]
@@ -229,7 +240,7 @@ fn payout_memo(pot: &MatchPot, payout: &Payout) -> String {
                     }
                 };
                 let human_winners =
-                    (0..4).any(|player| pot.kinds[player] == 0 && same_side(player));
+                    (0..4).any(|player| pot.participates(player) && same_side(player));
                 if !human_winners {
                     "Entry refunded".into()
                 } else if same_side(payout.player) {
@@ -302,13 +313,14 @@ impl Demo {
             u32::try_from(setting("SATS_ARENA_SURCHARGE_BPS", 0)?)
                 .map_err(|_| Error::Rejected("invalid routing surcharge".into()))?,
         )?;
+        pot.set_cpu_wallets(cpu_wallets_setting(false)?)?;
         if let Some(roster) = roster {
             pot.configure(roster.teams, roster.kinds, roster.team_ids)?;
         }
         let mut invoices = std::array::from_fn(|_| String::new());
         let mut hashes = std::array::from_fn(|_| String::new());
         for i in 0..4 {
-            if !simulated || pot.kinds[i] != 0 {
+            if !simulated || !pot.participates(i) {
                 continue;
             }
             let invoice = wallet
@@ -323,10 +335,11 @@ impl Demo {
             .cloned()
             .collect();
         Ok(Saved {
-            schema: 3,
+            schema: 4,
             wallet_identity: None,
             invoice_addresses: Default::default(),
             retired_entries: vec![],
+            pending_matches: vec![],
             roster: None,
             next_roster: None,
             events: vec![],
@@ -524,7 +537,7 @@ impl Demo {
                 "payment state belongs to a different wallet mode".into(),
             ));
         }
-        if !(1..=3).contains(&saved.schema) {
+        if !(1..=4).contains(&saved.schema) {
             return Err(Error::Rejected("unsupported prepaid match state".into()));
         }
         if saved.schema == 1 && saved.pot.paid.iter().any(|paid| *paid) {
@@ -578,7 +591,7 @@ impl Demo {
         saved.activity.clear();
         saved.events.clear();
         saved.log_version = 1;
-        saved.schema = 3;
+        saved.schema = 4;
         let mut demo = Self {
             wallet,
             provider,
@@ -591,7 +604,15 @@ impl Demo {
             io: payment_io::PaymentIo::default(),
             _state_lock: state_lock,
         };
-        if demo.saved.pot.phase == Phase::Funding && !demo.saved.pot.paid.iter().any(|p| *p) {
+        demo.io.set_submission_rate(submission_rate_setting()?)?;
+        if matches!(demo.saved.pot.phase, Phase::Funding | Phase::Ready)
+            && !demo.saved.pot.paid.iter().any(|p| *p)
+        {
+            let cpu_wallets = cpu_wallets_setting(demo.saved.pot.cpu_wallets)?;
+            if cpu_wallets != demo.saved.pot.cpu_wallets {
+                demo.retire_entries();
+                demo.saved.pot.set_cpu_wallets(cpu_wallets)?;
+            }
             let setting = |name: &str, default: u64| -> Result<u64> {
                 match std::env::var(name) {
                     Ok(value) => value
@@ -631,6 +652,10 @@ impl Demo {
             && self.saved.pot.sats_per_percent == rate
             && self.saved.pot.batch_window_ms == batch_ms
             && self.saved.pot.surcharge_bps == surcharge_bps
+            && !(self.simulation.is_some()
+                && (0..4).any(|player| {
+                    self.saved.pot.participates(player) && self.saved.hashes[player].is_empty()
+                }))
         {
             return Ok(());
         }
@@ -644,7 +669,7 @@ impl Demo {
         self.saved.pot.set_surcharge_bps(surcharge_bps)?;
         if self.simulation.is_some() {
             for player in 0..4 {
-                if self.saved.pot.kinds[player] == 0 {
+                if self.saved.pot.participates(player) {
                     let invoice = self
                         .wallet
                         .create_invoice(
@@ -674,6 +699,9 @@ impl Demo {
         self.persist(&self.path)
     }
     fn persist(&self, path: &Path) -> Result<()> {
+        Self::persist_saved(&self.saved, path)
+    }
+    fn persist_saved(saved: &Saved, path: &Path) -> Result<()> {
         use std::io::Write;
         let temporary = path.with_extension("tmp");
         let mut options = std::fs::OpenOptions::new();
@@ -686,7 +714,7 @@ impl Demo {
         let mut file = options
             .open(&temporary)
             .map_err(|e| Error::Internal(e.into()))?;
-        file.write_all(&serde_json::to_vec(&self.saved)?)
+        file.write_all(&serde_json::to_vec(saved)?)
             .map_err(|e| Error::Internal(e.into()))?;
         file.sync_all().map_err(|e| Error::Internal(e.into()))?;
         std::fs::rename(temporary, path).map_err(|e| Error::Internal(e.into()))?;
@@ -711,7 +739,7 @@ impl Demo {
         }
     }
     fn supports_report(&self, report: &AddressVerification) -> bool {
-        let humans = self.saved.pot.kinds.iter().filter(|&&k| k == 0).count() as u64;
+        let humans = (0..4).filter(|&i| self.saved.pot.participates(i)).count() as u64;
         report.min_msat <= 1000
             && report.max_msat
                 >= self
@@ -721,11 +749,10 @@ impl Demo {
                     .saturating_mul(humans)
                     .saturating_mul(1000)
     }
-    async fn verify_receiver(&self, address: &LightningAddress) -> AddressCheck {
+    fn cached_receiver(&self, address: &LightningAddress) -> Option<AddressVerification> {
         // Cache capability checks, never payable invoices. Re-check compatibility
         // against this roster and pot, even when the address was seen before.
-        let cached = self
-            .saved
+        self.saved
             .verified_addresses
             .get(address.as_str())
             .into_iter()
@@ -739,31 +766,8 @@ impl Demo {
                 report.address == address.as_str()
                     && report.fresh(now_ms())
                     && self.supports_report(report)
-            });
-        if let Some(report) = cached {
-            return AddressCheck {
-                report: Some(report.clone()),
-                error: String::new(),
-            };
-        }
-        match tokio::time::timeout(Duration::from_secs(20), self.verifier.verify(address)).await {
-            Ok(Ok(report)) if report.address == address.as_str() => AddressCheck {
-                report: Some(report),
-                error: String::new(),
-            },
-            Ok(Ok(_)) => AddressCheck {
-                report: None,
-                error: "Verification returned a different receiving address".into(),
-            },
-            Ok(Err(error)) => AddressCheck {
-                report: None,
-                error: format!("{error:#}"),
-            },
-            Err(_) => AddressCheck {
-                report: None,
-                error: "Address verification timed out; try again".into(),
-            },
-        }
+            })
+            .cloned()
     }
     fn remember_receiver(&mut self, player: usize) {
         let address = self.saved.addresses[player].clone();
@@ -793,6 +797,9 @@ impl Demo {
         }
     }
     async fn next_match(&mut self, roster: Option<Roster>) -> Result<()> {
+        if self.saved.pot.phase == Phase::Playing {
+            return Err(Error::Rejected("Finish the active match first".into()));
+        }
         self.retire_entries();
         self.save()?;
         let folder = self.path.parent().unwrap().join("matches");
@@ -805,6 +812,17 @@ impl Demo {
         )
         .await?;
         next.retired_entries = self.saved.retired_entries.clone();
+        next.pending_matches = self.saved.pending_matches.clone();
+        if self.saved.pot.phase == Phase::Settling {
+            let mut previous = self.saved.clone();
+            previous.pending_matches.clear();
+            previous.retired_entries.clear();
+            previous.next_roster = None;
+            previous
+                .receipts
+                .retain(|r| previous.pot.payouts.iter().any(|p| p.id == r.id));
+            next.pending_matches.push(previous);
+        }
         next.roster = roster;
         next.addresses = self.saved.addresses.clone();
         next.verification = self.saved.verification.clone();
@@ -819,6 +837,80 @@ impl Demo {
             .extend(self.saved.used_entry_hashes.iter().cloned());
         self.saved = next;
         self.save()
+    }
+    fn payout_owner(&self, id: &str) -> Option<&Saved> {
+        std::iter::once(&self.saved)
+            .chain(self.saved.pending_matches.iter())
+            .find(|saved| saved.pot.payouts.iter().any(|p| p.id == id))
+    }
+    fn payout_owner_mut(&mut self, id: &str) -> Result<&mut Saved> {
+        if self.saved.pot.payouts.iter().any(|p| p.id == id) {
+            return Ok(&mut self.saved);
+        }
+        self.saved
+            .pending_matches
+            .iter_mut()
+            .find(|saved| saved.pot.payouts.iter().any(|p| p.id == id))
+            .ok_or(Error::NotFound)
+    }
+    fn finish_pending_matches(&mut self) -> Result<()> {
+        let completed: Vec<_> = self
+            .saved
+            .pending_matches
+            .iter()
+            .filter(|saved| saved.pot.phase == Phase::Settled)
+            .cloned()
+            .collect();
+        for mut saved in completed.iter().cloned() {
+            saved
+                .used_payment_hashes
+                .extend(saved.prepared.values().map(|p| p.payment_hash.clone()));
+            let path = self
+                .path
+                .parent()
+                .unwrap()
+                .join("matches")
+                .join(format!("{}.json", saved.pot.id));
+            Self::persist_saved(&saved, &path)?;
+        }
+        if !completed.is_empty() {
+            self.saved
+                .pending_matches
+                .retain(|saved| saved.pot.phase != Phase::Settled);
+            self.save()?;
+        }
+        Ok(())
+    }
+    fn background_payments(&self) -> (u64, u64) {
+        let pending = self
+            .saved
+            .pending_matches
+            .iter()
+            .map(|saved| saved.pot.pending().iter().sum::<u64>())
+            .sum::<u64>()
+            + self
+                .saved
+                .retired_entries
+                .iter()
+                .filter(|entry| entry.state != PayoutState::Paid)
+                .map(|entry| entry.received_sats.unwrap_or(0))
+                .sum::<u64>();
+        let failed = self
+            .saved
+            .pending_matches
+            .iter()
+            .flat_map(|saved| &saved.pot.payouts)
+            .filter(|payout| payout.state == PayoutState::Failed)
+            .map(|payout| payout.sats)
+            .sum::<u64>()
+            + self
+                .saved
+                .retired_entries
+                .iter()
+                .filter(|entry| entry.state == PayoutState::Failed)
+                .map(|entry| entry.received_sats.unwrap_or(0))
+                .sum::<u64>();
+        (pending.saturating_sub(failed), failed)
     }
     async fn command(&mut self, command: Command) -> Result<()> {
         match command {
@@ -887,8 +979,11 @@ impl Demo {
                 self.saved.addresses[player] = address.as_str().into();
                 self.saved.verification[player] = AddressCheck::default();
                 self.save()?;
-                self.saved.verification[player] = self.verify_receiver(&address).await;
-                self.remember_receiver(player);
+                self.start_verification(player, address);
+                // Immediate/cache-backed verifiers can finish in this turn;
+                // network checks never hold the coordinator or its busy flag.
+                tokio::task::yield_now().await;
+                self.finish_verifications().await?;
             }
             Command::Addresses(addresses) => {
                 let first = parse_address(&addresses[0])?;
@@ -909,18 +1004,16 @@ impl Demo {
                 self.saved.verification[0] = AddressCheck::default();
                 self.saved.verification[1] = AddressCheck::default();
                 self.save()?; // Never leave old verification attached to edited addresses.
-                let (first, second) =
-                    tokio::join!(self.verify_receiver(&first), self.verify_receiver(&second));
-                self.saved.verification[0] = first;
-                self.saved.verification[1] = second;
-                self.remember_receiver(0);
-                self.remember_receiver(1);
+                self.start_verification(0, first);
+                self.start_verification(1, second);
+                tokio::task::yield_now().await;
+                self.finish_verifications().await?;
             }
             Command::Action(action) => match action {
                 1 => {
-                    if self.saved.pot.phase != Phase::Settled {
+                    if !matches!(self.saved.pot.phase, Phase::Settled | Phase::Settling) {
                         return Err(Error::Rejected(
-                            "previous match payouts are not complete".into(),
+                            "Finish the active match before starting another".into(),
                         ));
                     }
                     let roster = self.saved.roster.clone();
@@ -938,8 +1031,8 @@ impl Demo {
                         (action - 7) as usize
                     };
                     self.require_addresses()?;
-                    if self.saved.pot.kinds[player] != 0 {
-                        return Err(Error::Rejected("only humans fund entries".into()));
+                    if !self.saved.pot.participates(player) {
+                        return Err(Error::Rejected("this player does not fund an entry".into()));
                     }
                     if let Some(players) = &self.sandbox_players {
                         use sats_arena_core::wallet::{NWC_WALLET_MANAGED_FEES, NwcWallet};
@@ -1006,22 +1099,13 @@ impl Demo {
                 _ => return Err(Error::Rejected("unknown prepaid match action".into())),
             },
         }
+        self.consolidate_outbound()?;
         self.save()?;
         Ok(())
     }
     fn require_addresses(&self) -> Result<()> {
-        if self
-            .saved
-            .retired_entries
-            .iter()
-            .any(|entry| entry.received_sats.is_some() && entry.state != PayoutState::Paid)
-        {
-            return Err(Error::Rejected(
-                "A previous entry return is still pending".into(),
-            ));
-        }
         for (player, address) in self.saved.addresses.iter().enumerate() {
-            if self.saved.pot.kinds[player] != 0 {
+            if !self.saved.pot.participates(player) {
                 continue;
             }
             parse_address(address)?;
@@ -1087,26 +1171,21 @@ impl Demo {
     }
     fn view(&self) -> Result<LocalView> {
         let pot = &self.saved.pot;
+        let (background_pending_sats, background_failed_sats) = self.background_payments();
         let mut view = LocalView {
-            phase: if self
-                .saved
-                .retired_entries
-                .iter()
-                .any(|entry| entry.received_sats.is_some() && entry.state != PayoutState::Paid)
-            {
-                6
-            } else {
-                match pot.phase {
-                    Phase::Funding => 1,
-                    Phase::Ready => 2,
-                    Phase::Playing => 3,
-                    Phase::Settling => 6,
-                    Phase::Settled => 4,
-                }
+            phase: match pot.phase {
+                Phase::Funding => 1,
+                Phase::Ready => 2,
+                Phase::Playing => 3,
+                Phase::Settling => 6,
+                Phase::Settled => 4,
             },
             busy: 0,
             simulated: u32::from(self.simulation.is_some()),
             sandbox: u32::from(self.sandbox_players.is_some()),
+            cpu_wallets: u32::from(pot.cpu_wallets),
+            background_pending_sats,
+            background_failed_sats,
             entry_sats: pot.entry_sats,
             batch_window_ms: pot.batch_window_ms,
             surcharge_bps: pot.surcharge_bps,
@@ -1137,7 +1216,13 @@ impl Demo {
             text(&mut view.invoices[i], &self.saved.invoices[i]);
             text(&mut view.addresses[i], &self.saved.addresses[i]);
             let check = &self.saved.verification[i];
-            if let Some(report) = &check.report {
+            if self.io.verifying(i, &self.saved.addresses[i]) {
+                view.verification_state[i] = 1;
+                text(
+                    &mut view.verification_message[i],
+                    "Checking receiver; other players can continue editing",
+                );
+            } else if let Some(report) = &check.report {
                 view.min_sendable_msat[i] = report.min_msat;
                 view.max_sendable_msat[i] = report.max_msat;
                 view.verification_checked_ms[i] = report.checked_at_ms;
@@ -1218,6 +1303,25 @@ fn parse_address(input: &str) -> Result<LightningAddress> {
 fn default_simulated() -> bool {
     true
 }
+fn cpu_wallets_setting(default: bool) -> Result<bool> {
+    match std::env::var("SATS_ARENA_CPU_WALLETS") {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(_) => Err(Error::Rejected(
+            "SATS_ARENA_CPU_WALLETS must be 0 or 1".into(),
+        )),
+        Err(_) => Ok(default),
+    }
+}
+fn submission_rate_setting() -> Result<u32> {
+    std::env::var("SATS_ARENA_PAYMENTS_PER_SECOND")
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| Error::Rejected("invalid payment submission rate".into()))
+        })
+        .unwrap_or(Ok(1))
+}
 fn default_fee_limit() -> u64 {
     10
 }
@@ -1240,6 +1344,7 @@ fn text<const N: usize>(buffer: &mut [u8; N], value: &str) {
 pub struct LocalHandle {
     sender: SyncSender<Command>,
     shared: Arc<Mutex<LocalView>>,
+    outbound: Arc<outbound_debug::DebugView>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -1272,6 +1377,8 @@ pub unsafe extern "C" fn arena_local_create_configured(
         let folder = PathBuf::from(folder);
         let shared = Arc::new(Mutex::new(LocalView::default()));
         let target = shared.clone();
+        let outbound = Arc::new(outbound_debug::DebugView::default());
+        let outbound_target = outbound.clone();
         let (sender, receiver) = mpsc::sync_channel(16);
         let worker = std::thread::Builder::new()
             .name("arena-local-wallet".into())
@@ -1315,7 +1422,7 @@ pub unsafe extern "C" fn arena_local_create_configured(
                         return;
                     }
                 };
-                runtime.block_on(run_worker(demo, receiver, target));
+                runtime.block_on(run_worker(demo, receiver, target, outbound_target));
             });
         let Ok(worker) = worker else {
             return std::ptr::null_mut();
@@ -1323,6 +1430,7 @@ pub unsafe extern "C" fn arena_local_create_configured(
         Box::into_raw(Box::new(LocalHandle {
             sender,
             shared,
+            outbound,
             worker: Some(worker),
         }))
     })
@@ -1336,8 +1444,10 @@ async fn run_worker(
     mut demo: Demo,
     receiver: mpsc::Receiver<Command>,
     target: Arc<Mutex<LocalView>>,
+    outbound: Arc<outbound_debug::DebugView>,
 ) {
     let mut message = String::new();
+    let mut outbound_history = outbound_debug::History::default();
     loop {
         let processed_action = match receiver.try_recv() {
             Ok(action) => {
@@ -1371,6 +1481,7 @@ async fn run_worker(
             text(&mut view.payment_error, &payment_message);
             *previous = view;
         }
+        outbound.refresh(&demo, &mut outbound_history);
         // Keep the runtime polling NWC relay tasks between commands.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1434,6 +1545,7 @@ pub unsafe extern "C" fn arena_local_destroy(handle: *mut LocalHandle) {
         let LocalHandle {
             sender,
             shared: _,
+            outbound: _,
             mut worker,
         } = *unsafe { Box::from_raw(handle) };
         drop(sender);
@@ -1883,7 +1995,7 @@ mod tests {
 
     #[test]
     fn two_fresh_invoices_live_outgoing_payout_then_winner_pot_and_new_invoices() {
-        assert_eq!(std::mem::size_of::<LocalView>(), 14760);
+        assert_eq!(std::mem::size_of::<LocalView>(), 14784);
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
         let initial = host.wait(|v| v.busy == 0);
@@ -1978,7 +2090,15 @@ mod tests {
             assert_eq!(recovered.saved.pot.phase, Phase::Settling);
             assert_eq!(recovered.saved.pot.earned, [0, 992, 0, 0]);
             assert_eq!(recovered.simulation.as_ref().unwrap().payment_attempts(), 1); // Only the new winner payout.
-            assert!(recovered.command(Command::Action(1)).await.is_err());
+            recovered.command(Command::Action(1)).await.unwrap();
+            assert_eq!(recovered.saved.pot.phase, Phase::Funding);
+            assert_eq!(recovered.saved.pot.paid, [false; 4]);
+            assert_eq!(recovered.saved.pending_matches.len(), 1);
+            assert_eq!(
+                recovered.saved.pending_matches[0].pot.pending(),
+                [8, 0, 0, 0]
+            );
+            assert_eq!(recovered.simulation.as_ref().unwrap().payment_attempts(), 1);
         });
     }
 

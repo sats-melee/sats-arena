@@ -4,8 +4,10 @@ The embedded game uses `arena_pot::MatchPot`. The older balance/server API and
 legacy two-slot pot are separate prototypes and do not define this flow.
 
 Each active human verifies a receiving Lightning Address and funds a fresh entry
-(default 500 sats); CPUs require neither and have no financial pot. All humans
-must have fresh compatible verification and confirmed entries before Start.
+(default 500 sats); CPUs are excluded unless the launcher developer option
+**CPU wallets** is enabled. With that option, CPUs use the same verification,
+entry, damage, winnings and refund rules as humans. Every financial participant
+must have fresh compatible verification and a confirmed entry before Start.
 The CSS roster, mode and team IDs are bound to admission and checked again
 against the actual match-start setup. Changing a funded lobby settles returns
 before a new roster receives fresh invoices. The four player cards scroll.
@@ -14,27 +16,30 @@ before a new roster receives fresh invoices. The four player cards scroll.
 
 Finalized game credits carry attacker, victim, damage and an ordered sequence.
 Opponent damage steals from the victim's remaining contribution at the configured
-rate (default 1 sat per 1%). Self/environmental damage, friendly fire, CPU attacks
-and hits against CPUs transfer nothing. CPU/friendly observations still advance
+rate (default 1 sat per 1%). Self/environmental damage, friendly fire, and hits
+involving CPUs without wallets transfer nothing. All observations still advance
 the sequence. Fractional sats accumulate per attacker/victim pair; victim funds
 cannot go negative. Ordered processing preserves which attacker exhausted a pot.
 
 Each recipient's first whole sat starts a five-second deadline. Later hits join
-without extending it. Freeze each due batch under an immutable payout ID. New
-hits start a new batch even if an older outgoing payment remains unresolved.
+without extending it. Due amounts join one never-submitted queue total per
+recipient. Original intents retain an audit link when consolidated into a new
+payment. Submitted payments retain their immutable amount, ID and invoice.
 Duplicate credits are ignored; gaps are rejected before mutation. A missing or
 incomplete stream cannot authorize a winner payout.
 
 ## Results
 
-Flush unbatched damage earnings into final settlement payments, retaining all
-previously frozen payout IDs. In FFA, return the winning human's own remainder
+Combine unbatched earnings, never-submitted queue totals, and final allocations
+into one final payment per recipient. In-flight payments remain separate. In
+FFA, return the winning financial participant's own remainder
 and award all losers' remaining contributions to that player. In teams, return
-each winning human's own remainder and split all losing sides' remaining funds
-equally among all winning humans, including eliminated teammates. CPU teammates
-never take a share. Assign indivisible sats in ascending player-port order.
+each winner's own remainder and split all losing sides' remaining funds equally
+among winning financial participants, including eliminated teammates. CPU
+teammates with wallets take the same share as humans. Assign indivisible sats in
+ascending player-port order.
 
-CPU-only winning side, draw, no contest, interrupted game or incomplete data:
+Winning side with no financial participants, draw, no contest, interrupted game or incomplete data:
 keep accrued damage earnings and return unspent funds to their owners. There
 is no fixed victory bonus, reusable balance, or re-spending of damage earnings.
 
@@ -47,9 +52,14 @@ Final payouts: `[232,768,0,1000]`, totaling 2000 sats.
 
 The host persists received entries, ordered credits, recipient-bound invoices,
 payout intent and confirmation. A recovered InFlight payment is looked up and
-never blindly resent. An unresolved return blocks new funding. Schema 2 local
-state migrates from two slots while retaining funds, payout IDs and fractional
-carry. Completed games are archived before creating the next pot.
+never blindly resent. Unresolved earlier games recover in the background while
+the next match uses fresh entries. Their status never gates a new match. A
+separate note near the top of the native panel shows earlier pending payouts
+and any failures needing attention, and says that play can continue. The note
+clears once those payments are resolved; wallet errors cannot replace it.
+Older local state migrates to schema 4 while
+retaining funds, payout IDs and fractional carry. Schema 4 also persists the CPU
+wallet option and consolidation audit links. Completed games are archived.
 
 The wallet/provider interfaces are independent of NWC or another backend.
 The launcher selects either simulated execution or a saved NWC connection.

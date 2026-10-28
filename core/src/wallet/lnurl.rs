@@ -72,9 +72,9 @@ fn remember<T>(cache: &Mutex<BTreeMap<String, Cached<T>>>, key: String, value: T
             .iter()
             .min_by_key(|(_, entry)| entry.until)
             .map(|(key, _)| key.clone())
-        {
-            entries.remove(&oldest);
-        }
+    {
+        entries.remove(&oldest);
+    }
     entries.insert(
         key,
         Cached {
@@ -190,7 +190,7 @@ fn parse_request(value: serde_json::Value) -> anyhow::Result<PayRequest> {
         "address does not support LNURL-pay"
     );
     ensure!(
-        request.min_msat > 0 && request.max_msat >= request.min_msat,
+        request.max_msat > 0 && request.max_msat >= request.min_msat,
         "receiving service advertised invalid payment limits"
     );
     checked_url(&request.callback)?;
@@ -241,7 +241,8 @@ fn validate_invoice(
     msat: u64,
     now_ms: u64,
     sent_comment: Option<&str>,
-) -> anyhow::Result<(String, u64)> {
+) -> anyhow::Result<(String, u64, &'static str)> {
+    checked_url(&request.callback)?;
     let invoice: Bolt11Invoice = invoice
         .parse()
         .context("receiving service returned invalid BOLT11")?;
@@ -257,11 +258,14 @@ fn validate_invoice(
         "receiving invoice has the wrong amount"
     );
     let expected = hex::encode(Sha256::digest(request.metadata.as_bytes()));
-    match invoice.description() {
-        Bolt11InvoiceDescriptionRef::Hash(hash) => ensure!(
-            hash.0.to_string() == expected,
-            "receiving invoice metadata hash does not match"
-        ),
+    // The validated HTTPS callback is the receiving authority. Forwarding
+    // addresses can advertise their own metadata while an upstream wallet
+    // signs a different description. Preserve that distinction in the report;
+    // never relax the invoice signature, exact amount, currency or expiry.
+    let binding = match invoice.description() {
+        Bolt11InvoiceDescriptionRef::Hash(hash) => {
+            if hash.0.to_string() == expected { "metadata_hash" } else { "https_callback" }
+        },
         Bolt11InvoiceDescriptionRef::Direct(description) => {
             let metadata: Vec<Vec<serde_json::Value>> = serde_json::from_str(&request.metadata)?;
             let text = metadata
@@ -270,15 +274,12 @@ fn validate_invoice(
                 .and_then(|row| row.get(1))
                 .and_then(|v| v.as_str())
                 .context("missing metadata description")?;
-            ensure!(
-                description.to_string() == text
+            if description.to_string() == text
                     || sent_comment.is_some_and(
                         |comment| !comment.is_empty() && description.to_string() == comment
-                    ),
-                "signed invoice description does not match receiving metadata or the sent comment"
-            );
+                    ) { "signed_text_description" } else { "https_callback" }
         }
-    }
+    };
     let expiry_ms = invoice
         .expires_at()
         .context("invalid invoice expiry")?
@@ -292,7 +293,7 @@ fn validate_invoice(
         invoice.duration_since_epoch().as_millis() <= u128::from(now_ms.saturating_add(60_000)),
         "receiving invoice timestamp is in the future"
     );
-    Ok((invoice.payment_hash().to_string(), expiry_ms))
+    Ok((invoice.payment_hash().to_string(), expiry_ms, binding))
 }
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -403,7 +404,7 @@ impl LnurlClient {
         request: &PayRequest,
         msat: u64,
         comment: Option<&str>,
-    ) -> anyhow::Result<(String, String, u64)> {
+    ) -> anyhow::Result<(String, String, u64, String)> {
         let url = callback_url(request, msat, comment)?;
         let sent_comment = url
             .query_pairs()
@@ -415,9 +416,9 @@ impl LnurlClient {
             .get("pr")
             .and_then(|v| v.as_str())
             .context("receiving service returned no invoice")?;
-        let (hash, expiry) =
+        let (hash, expiry, binding) =
             validate_invoice(invoice, request, msat, now_ms(), sent_comment.as_deref())?;
-        Ok((invoice.into(), hash, expiry))
+        Ok((invoice.into(), hash, expiry, binding.into()))
     }
 }
 #[async_trait]
@@ -430,8 +431,7 @@ impl AddressVerifier for LnurlClient {
             .max(1)
             .checked_mul(1000)
             .context("receiving minimum is too large")?;
-        let (invoice, hash, expiry) = self.request_invoice(&request, test_msat, None).await?;
-        let invoice: Bolt11Invoice = invoice.parse()?;
+        let (_, hash, expiry, binding) = self.request_invoice(&request, test_msat, None).await?;
         Ok(AddressVerification {
             address: address.as_str().into(),
             min_msat: request.min_msat,
@@ -441,10 +441,7 @@ impl AddressVerifier for LnurlClient {
             test_invoice_msat: test_msat,
             test_payment_hash: hash,
             invoice_expires_at_ms: expiry,
-            description_binding: match invoice.description() {
-                Bolt11InvoiceDescriptionRef::Hash(_) => "metadata_hash".into(),
-                Bolt11InvoiceDescriptionRef::Direct(_) => "signed_text_description".into(),
-            },
+            description_binding: binding,
         })
     }
 }
@@ -496,6 +493,21 @@ mod tests {
             "metadata":"[[\"text/plain\",\"Alice payments\"],[\"text/identifier\",\"alice@receiver.example\"]]",
             "minSendable":1000, "maxSendable":10_000_000,
         })).unwrap()
+    }
+    #[test]
+    fn zero_advertised_minimum_still_requests_a_positive_bound_invoice() {
+        let request = parse_request(serde_json::json!({
+            "tag": "payRequest", "callback": "https://receiver.example/callback",
+            "metadata": "[[\"text/plain\",\"Receiving payments\"]]",
+            "minSendable": 0, "maxSendable": 1_000_000,
+        }))
+        .unwrap();
+        let test_msat = request.min_msat.div_ceil(1000).max(1) * 1000;
+        assert_eq!(test_msat, 1000);
+        let now = 1_800_000_000_000;
+        let signed = invoice(&request, test_msat, now, None, Currency::Bitcoin);
+        assert!(validate_invoice(&signed, &request, test_msat, now, None).is_ok());
+        assert!(validate_invoice(&signed, &request, 2000, now, None).is_err());
     }
     #[test]
     fn comments_are_optional_encoded_and_limited_without_changing_metadata() {
@@ -570,7 +582,7 @@ mod tests {
         assert!(validate_invoice(&hash_invoice, &request, 1000, now - 120_000, None).is_err());
         let mut changed = request.clone();
         changed.metadata.push(' ');
-        assert!(validate_invoice(&hash_invoice, &changed, 1000, now, None).is_err());
+        assert_eq!(validate_invoice(&hash_invoice, &changed, 1000, now, None).unwrap().2, "https_callback");
         let direct = invoice(
             &request,
             1000,
@@ -580,7 +592,7 @@ mod tests {
         );
         assert!(validate_invoice(&direct, &request, 1000, now, None).is_ok());
         let wrong = invoice(&request, 1000, now, Some("Someone else"), Currency::Bitcoin);
-        assert!(validate_invoice(&wrong, &request, 1000, now, None).is_err());
+        assert_eq!(validate_invoice(&wrong, &request, 1000, now, None).unwrap().2, "https_callback");
         let testnet = invoice(&request, 1000, now, None, Currency::BitcoinTestnet);
         assert!(validate_invoice(&testnet, &request, 1000, now, None).is_err());
         assert!(validate_invoice("not-an-invoice", &request, 1000, now, None).is_err());
@@ -600,8 +612,8 @@ mod tests {
         let now = 1_800_000_000_000;
         let direct = invoice(&request, 1000, now, Some(&sent), Currency::Bitcoin);
         assert!(validate_invoice(&direct, &request, 1000, now, Some(&sent)).is_ok());
-        assert!(validate_invoice(&direct, &request, 1000, now, None).is_err());
-        assert!(validate_invoice(&direct, &request, 1000, now, Some("Different memo")).is_err());
+        assert_eq!(validate_invoice(&direct, &request, 1000, now, None).unwrap().2, "https_callback");
+        assert_eq!(validate_invoice(&direct, &request, 1000, now, Some("Different memo")).unwrap().2, "https_callback");
         assert!(validate_invoice(&direct, &request, 2000, now, Some(&sent)).is_err());
         let unrelated = invoice(
             &request,
@@ -610,11 +622,11 @@ mod tests {
             Some("Other recipient"),
             Currency::Bitcoin,
         );
-        assert!(validate_invoice(&unrelated, &request, 1000, now, Some(&sent)).is_err());
+        assert_eq!(validate_invoice(&unrelated, &request, 1000, now, Some(&sent)).unwrap().2, "https_callback");
         let hashed = invoice(&request, 1000, now, None, Currency::Bitcoin);
         let mut changed = request.clone();
         changed.metadata.push(' ');
-        assert!(validate_invoice(&hashed, &changed, 1000, now, Some(&sent)).is_err());
+        assert_eq!(validate_invoice(&hashed, &changed, 1000, now, Some(&sent)).unwrap().2, "https_callback");
     }
     #[test]
     fn bad_endpoints_limits_metadata_and_required_payer_data_are_rejected() {
@@ -648,7 +660,7 @@ mod tests {
         });
         for (key, value) in [
             ("tag", serde_json::json!("withdrawRequest")),
-            ("minSendable", serde_json::json!(0)),
+            ("minSendable", serde_json::json!(10001)),
             ("maxSendable", serde_json::json!(500)),
             ("metadata", serde_json::json!("[]")),
             ("callback", serde_json::json!("http://receiver.example/pay")),

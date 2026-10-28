@@ -13,7 +13,7 @@ pub use lnurl::{AddressVerification, AddressVerifier, LnurlClient, VERIFICATION_
 use async_trait::async_trait;
 
 pub use fake::{FakeAddressInvoices, FakeWallet};
-pub use nwc::{NWC_WALLET_MANAGED_FEES, NwcWallet};
+pub use nwc::{IncomingReceiptError, NWC_WALLET_MANAGED_FEES, NwcWallet};
 
 pub struct NewInvoice {
     pub bolt11: String,

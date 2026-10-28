@@ -3,6 +3,82 @@ use sats_arena_core::wallet::{DecodedInvoice, NewInvoice};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
+struct HeldVerifier {
+    gate: Semaphore,
+}
+#[async_trait::async_trait]
+impl AddressVerifier for HeldVerifier {
+    async fn verify(&self, address: &LightningAddress) -> anyhow::Result<AddressVerification> {
+        if address.as_str() == "nic@lawallet.io" {
+            self.gate.acquire().await.unwrap().forget();
+        }
+        if address.as_str() == "unavailable@example.test" {
+            anyhow::bail!("Receiving service is unavailable; retry this player");
+        }
+        TestVerifier.verify(address).await
+    }
+}
+
+#[tokio::test]
+async fn slow_address_check_does_not_hold_other_players_or_the_coordinator() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut demo = Demo::open(dir.path()).await.unwrap();
+    let verifier = Arc::new(HeldVerifier {
+        gate: Semaphore::new(0),
+    });
+    demo.verifier = verifier.clone();
+    let started = std::time::Instant::now();
+    demo.command(Command::Address(0, "nic@lawallet.io".into()))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(demo.view().unwrap().verification_state[0], 1);
+    demo.command(Command::Address(1, "agustin@lacrypta.ar".into()))
+        .await
+        .unwrap();
+    drive(&mut demo, |d| d.view().unwrap().verification_state[1] == 2).await;
+    assert_eq!(demo.view().unwrap().verification_state[0], 1);
+    assert_eq!(demo.view().unwrap().busy, 0);
+
+    // Replacing an in-flight input cancels its result without changing its neighbor.
+    demo.command(Command::Address(0, "unavailable@example.test".into()))
+        .await
+        .unwrap();
+    drive(&mut demo, |d| d.view().unwrap().verification_state[0] == 3).await;
+    assert_eq!(demo.view().unwrap().verification_state[1], 2);
+    assert_eq!(demo.saved.addresses[0], "unavailable@example.test");
+    verifier.gate.add_permits(1);
+    demo.tick().await.unwrap();
+    assert_eq!(demo.saved.addresses[0], "unavailable@example.test");
+    assert_eq!(demo.view().unwrap().verification_state[0], 3);
+    demo.command(Command::Address(0, "recovered@example.test".into()))
+        .await
+        .unwrap();
+    drive(&mut demo, |d| d.view().unwrap().verification_state[0] == 2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn address_timeout_ends_checking_and_keeps_successful_neighbors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut demo = Demo::open(dir.path()).await.unwrap();
+    demo.verifier = Arc::new(HeldVerifier {
+        gate: Semaphore::new(0),
+    });
+    demo.command(Command::Address(0, "nic@lawallet.io".into()))
+        .await
+        .unwrap();
+    demo.command(Command::Address(1, "agustin@lacrypta.ar".into()))
+        .await
+        .unwrap();
+    assert_eq!(demo.view().unwrap().verification_state[..2], [1, 2]);
+    tokio::time::advance(Duration::from_secs(16)).await;
+    tokio::task::yield_now().await;
+    demo.tick().await.unwrap();
+    assert_eq!(demo.view().unwrap().verification_state[..2], [3, 2]);
+    assert!(demo.saved.verification[0].error.contains("15 seconds"));
+    assert_eq!(demo.view().unwrap().busy, 0);
+}
+
 struct HeldWallet {
     inner: Arc<FakeWallet>,
     calls: AtomicUsize,
@@ -66,7 +142,7 @@ async fn playing(path: &Path, hold_all: bool) -> (Demo, Arc<HeldWallet>) {
     (demo, wallet)
 }
 async fn drive(demo: &mut Demo, ready: impl Fn(&Demo) -> bool) {
-    let until = std::time::Instant::now() + Duration::from_secs(3);
+    let until = std::time::Instant::now() + Duration::from_secs(5);
     while !ready(demo) {
         demo.tick().await.unwrap();
         assert!(
@@ -142,13 +218,16 @@ async fn concurrent_submissions_are_bounded_and_persisted_before_dispatch() {
     for sequence in [1, 3, 5] {
         hits(&mut demo, sequence);
     }
-    drive(&mut demo, |_| wallet.calls.load(Ordering::SeqCst) == 4).await;
+    drive(&mut demo, |_| wallet.calls.load(Ordering::SeqCst) == 2).await;
+    for sequence in [7, 9] {
+        hits(&mut demo, sequence);
+    }
     for _ in 0..10 {
         demo.tick().await.unwrap();
         tokio::task::yield_now().await;
     }
-    assert_eq!(wallet.calls.load(Ordering::SeqCst), 4);
-    assert_eq!(wallet.peak.load(Ordering::SeqCst), 4);
+    assert_eq!(wallet.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(wallet.peak.load(Ordering::SeqCst), 2);
     let saved: Saved =
         serde_json::from_slice(&std::fs::read(dir.path().join("prepaid-match.json")).unwrap())
             .unwrap();
@@ -159,8 +238,18 @@ async fn concurrent_submissions_are_bounded_and_persisted_before_dispatch() {
             .iter()
             .filter(|p| p.state == PayoutState::InFlight)
             .count(),
-        4
+        2
     );
+    assert_eq!(
+        saved
+            .pot
+            .payouts
+            .iter()
+            .filter(|p| p.state == PayoutState::Created)
+            .count(),
+        2
+    );
+    assert_eq!(saved.pot.pending(), [50, 50, 0, 0]);
     for payout in saved
         .pot
         .payouts
@@ -175,15 +264,12 @@ async fn concurrent_submissions_are_bounded_and_persisted_before_dispatch() {
     }
     wallet.gate.add_permits(6);
     drive(&mut demo, |d| {
-        d.saved
-            .pot
-            .payouts
-            .iter()
-            .all(|p| p.state == PayoutState::Paid)
+        d.saved.pot.payouts.iter().all(|p| p.state.complete())
     })
     .await;
-    assert_eq!(wallet.calls.load(Ordering::SeqCst), 6);
-    assert_eq!(wallet.peak.load(Ordering::SeqCst), 4);
+    assert_eq!(wallet.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(wallet.peak.load(Ordering::SeqCst), 2);
+    assert_eq!(demo.saved.pot.earned, [50, 50, 0, 0]);
 }
 #[tokio::test]
 async fn actual_coordinator_acknowledges_credit_while_wallet_request_is_held() {
@@ -192,7 +278,8 @@ async fn actual_coordinator_acknowledges_credit_while_wallet_request_is_held() {
     hits(&mut demo, 1);
     let (sender, receiver) = mpsc::sync_channel(16);
     let shared = Arc::new(Mutex::new(LocalView::default()));
-    let task = tokio::spawn(run_worker(demo, receiver, shared.clone()));
+    let outbound = Arc::new(outbound_debug::DebugView::default());
+    let task = tokio::spawn(run_worker(demo, receiver, shared.clone(), outbound.clone()));
     let until = std::time::Instant::now() + Duration::from_secs(3);
     while wallet.calls.load(Ordering::SeqCst) != 2 {
         assert!(std::time::Instant::now() < until);
@@ -201,6 +288,7 @@ async fn actual_coordinator_acknowledges_credit_while_wallet_request_is_held() {
     let handle = LocalHandle {
         sender,
         shared: shared.clone(),
+        outbound,
         worker: None,
     };
     let credit = LocalCredit {
@@ -251,6 +339,90 @@ async fn stopping_with_network_jobs_in_flight_recovers_by_lookup_only() {
     assert_eq!(recovered.saved.pot.pending(), [10, 10, 0, 0]);
 }
 
+#[tokio::test]
+async fn pending_previous_game_survives_restart_and_editing_without_blocking_a_fresh_paid_game() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut demo, wallet) = playing(dir.path(), true).await;
+    hits(&mut demo, 1);
+    demo.command(Command::Action(8)).await.unwrap();
+    drive(&mut demo, |_| wallet.calls.load(Ordering::SeqCst) == 2).await;
+    let previous_id = demo.saved.pot.id.clone();
+    let original_addresses = demo.saved.addresses.clone();
+    demo.command(Command::Action(1)).await.unwrap();
+    assert_eq!(demo.saved.pot.paid, [false; 4]);
+    assert_eq!(demo.view().unwrap().background_pending_sats, 1000);
+    assert_eq!(demo.view().unwrap().background_failed_sats, 0);
+    assert_eq!(
+        demo.saved.pending_matches[0]
+            .pot
+            .pending()
+            .iter()
+            .sum::<u64>(),
+        1000
+    );
+    let original_prepared = serde_json::to_value(&demo.saved.pending_matches[0].prepared).unwrap();
+    drop(demo);
+    tokio::task::yield_now().await;
+
+    let mut demo = Demo::open(dir.path()).await.unwrap();
+    demo.command(Command::Addresses([
+        "carol@example.test".into(),
+        "dave@example.test".into(),
+    ]))
+    .await
+    .unwrap();
+    demo.command(Command::Action(2)).await.unwrap();
+    demo.command(Command::Action(3)).await.unwrap();
+    demo.reconcile().await.unwrap();
+    demo.command(Command::Action(4)).await.unwrap();
+    assert_eq!(demo.view().unwrap().phase, 3);
+    assert_eq!(demo.view().unwrap().background_pending_sats, 1000);
+    assert_eq!(demo.saved.pending_matches[0].addresses, original_addresses);
+    assert_eq!(
+        serde_json::to_value(&demo.saved.pending_matches[0].prepared).unwrap(),
+        original_prepared
+    );
+    hits(&mut demo, 1);
+    demo.command(Command::Action(8)).await.unwrap();
+    demo.reconcile().await.unwrap();
+    assert_eq!(demo.saved.pot.phase, Phase::Settled);
+    assert_eq!(demo.saved.pot.earned.iter().sum::<u64>(), 1000);
+    let attempts = demo.simulation.as_ref().unwrap().payment_attempts();
+    assert_eq!(attempts, 2); // This game's damage and returns coalesce per recipient.
+    assert_eq!(demo.saved.pending_matches.len(), 1);
+    let hashes: Vec<_> = demo.saved.pending_matches[0]
+        .prepared
+        .values()
+        .map(|p| p.payment_hash.clone())
+        .collect();
+    for hash in hashes {
+        demo.simulation
+            .as_ref()
+            .unwrap()
+            .set_payment_state(&hash, PaymentState::Succeeded { fee_sats: 0 });
+    }
+    demo.reconcile().await.unwrap();
+    assert!(demo.saved.pending_matches.is_empty());
+    assert_eq!(demo.view().unwrap().background_pending_sats, 0);
+    assert_eq!(
+        demo.simulation.as_ref().unwrap().payment_attempts(),
+        attempts
+    );
+    let archived: Saved = serde_json::from_slice(
+        &std::fs::read(
+            dir.path()
+                .join("matches")
+                .join(format!("{previous_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(archived.pot.phase, Phase::Settled);
+    assert_eq!(archived.pot.earned.iter().sum::<u64>(), 1000);
+    assert_eq!(archived.receipts.len(), 2);
+    assert_eq!(archived.addresses, original_addresses);
+}
+
 struct ReusedInvoice;
 #[async_trait::async_trait]
 impl AddressInvoices for ReusedInvoice {
@@ -267,7 +439,8 @@ async fn concurrent_reused_hash_is_paid_once_and_network_error_does_not_reject_c
     wallet.gate.add_permits(1);
     let (sender, receiver) = mpsc::sync_channel(16);
     let shared = Arc::new(Mutex::new(LocalView::default()));
-    let task = tokio::spawn(run_worker(demo, receiver, shared.clone()));
+    let outbound = Arc::new(outbound_debug::DebugView::default());
+    let task = tokio::spawn(run_worker(demo, receiver, shared.clone(), outbound.clone()));
     let until = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         let view = *shared.lock().unwrap();
@@ -280,6 +453,7 @@ async fn concurrent_reused_hash_is_paid_once_and_network_error_does_not_reject_c
     let handle = LocalHandle {
         sender,
         shared: shared.clone(),
+        outbound,
         worker: None,
     };
     let credit = LocalCredit {

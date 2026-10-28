@@ -9,16 +9,28 @@ The first whole sat owed starts a **five-second deadline** for that recipient.
 Later hits add to that batch without extending its deadline. There is no
 minimum amount beyond the one-sat granularity of the accounting.
 
-At the deadline, freeze the batch into an immutable payout ID and submit it.
-Damage at or after that cutoff starts another batch, even while the previous
-payment is in flight. Recipients have independent deadlines.
+At the deadline, close the batch into the recipient's outbound queue. Further
+closed batches join any never-submitted amount for that recipient. Consolidation
+creates a new payout ID and marks original intents `Superseded`, retaining their
+amounts, original invoices and replacement IDs for audit. Superseded invoices
+are never paid. Recipients have independent deadlines.
 Scheduling runs on the background worker; it does not pause emulation.
 
-On match end, combine each recipient's still-open earnings with their final
-allocation in one settlement payment per recipient. A batch already frozen or
-in flight stays a separate payment with its original ID and invoice. No contest
+On match end, combine each recipient's open earnings, never-submitted queued
+intents, and final allocation into one settlement per recipient. An in-flight
+payment retains its original amount, ID and invoice; uncertain outcomes are
+looked up without resending. Definitively failed payments remain separate for
+review. No contest
 returns unspent contributions while keeping damage earnings, including unsent
 damage earnings, with their recipients.
+
+The dispatcher defaults to one new payment per second and at most two concurrent
+submission requests. Receiving-invoice preparation has four separate slots;
+outgoing confirmation checks have two. Old status checks cannot consume slots
+reserved for submitting payouts. Pending/error lookups back off from two to
+thirty seconds. Finalizing matches receive priority, with older queued recipients
+first within each priority. The launcher developer setting and
+`SATS_ARENA_PAYMENTS_PER_SECOND` select 1–20 starts/second.
 
 Deadlines are persisted Unix milliseconds; recovery flushes overdue windows
 once, without restarting the timer or duplicating the batch.
@@ -28,7 +40,13 @@ once, without restarting the timer or duplicating the batch.
 Each player enters a Lightning Address such as `alice@example.com`.
 Every participating human must have a current compatible live receiver check
 before entry invoices are displayed or entry payments can be simulated. CPUs
-require no address. Domains are normalized to
+require no address by default. **Developer options → CPU wallets** makes CPU
+slots full financial participants: each needs its own verified receiver and paid
+entry, can earn damage payments, and shares winning-side settlements. Its game
+control kind remains CPU. Sandbox supplies the existing player test wallets;
+**Pay from test wallet** sends a real NWC test-sat entry for that CPU. Live mode
+shows the usual entry invoice and receiving-address input. The option is frozen
+before funding and applies when LOCAL is next launched. Domains are normalized to
 lowercase; addresses persist across games and application restarts.
 
 Recipients are locked as soon as any entry payment is confirmed. New
@@ -39,6 +57,24 @@ The side panel shows pending sats and a countdown separately from confirmed
 paid-out sats. The payment log records UTC confirmation time, amount, player,
 receiving address and payment type. Fake receipts explicitly say SIMULATED.
 Receipts persist across matches; the window displays a bounded recent history.
+
+The optional **Show outbound payments** checkbox expands a read-only debugging
+view in the native payment panel. It lists every payout from the current match,
+recovering earlier matches, and the selected wallet's local match archives,
+including received late-entry refunds and open damage batches. Each record shows
+its full ID, player, amount, bound receiving address, type, and execution state:
+queued, requesting an invoice, sending, awaiting/checking confirmation, paid,
+failed, or consolidated. Consolidated originals link to their replacements.
+Outstanding jobs show their observed wait; confirmed receipts show UTC
+confirmation time. Unreadable archives are reported as incomplete history.
+The view is disabled by default, refreshes while open, and uses a variable-size
+snapshot so long matches are not truncated to the activity log's recent entries.
+Selecting text pauses display updates for copying. Enabling it makes no wallet
+requests and changes no ledger or payment state.
+
+Schema 4 stores CPU financial participation and consolidation audit records.
+Existing funded agreements retain their terms. Older builds reject schema 4
+rather than silently applying their earlier CPU payment rules.
 
 ## Backend-neutral execution
 
@@ -67,7 +103,7 @@ separate live `AddressVerifier` used by the GUI. See
 
 The NWC wallet adapter maps the wallet operations to make_invoice,
 lookup_invoice and pay_invoice as supported by the connected wallet, and uses
-a BOLT11 decoder for local validation. The batch scheduler is unchanged.
+a BOLT11 decoder for local validation.
 See [NWC's payment flow](https://docs.nwc.dev/introduction/introduction-to-nwc).
 
 The dispatcher verifies the resolved amount and payment hash. It persists
@@ -75,7 +111,8 @@ the recipient, invoice and hash **before** marking an outgoing intent in flight.
 It reuses that exact invoice after recovery, never requests another invoice
 for an existing prepared payout, and rejects reused payment hashes across
 matches. Unknown outcomes are looked up rather than blindly resent. Definitive
-failure stays visible and does not unlock a new funded match.
+failure stays reserved and visible for review while subsequent matches use
+separate fresh entries.
 
 The host has bounded wallet/resolver timeouts. Fees are separate from the
 advertised match funds; the adapter receives the configured fee limit
