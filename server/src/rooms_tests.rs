@@ -50,7 +50,7 @@ fn rooms_and_slot_claims_are_isolated_and_resume_requires_the_correct_token() {
         room.snapshot(0, "wrong-token"),
         ServerMessage::Error { .. }
     ));
-    assert!(rooms.join(&code, 2, None).is_err());
+    assert!(rooms.join(&code, 2, None).is_ok());
     assert!(rooms.join(&code, 4, None).is_err());
     let ServerMessage::State {
         snapshot: Some(view),
@@ -101,7 +101,7 @@ fn rooms_and_slot_claims_are_isolated_and_resume_requires_the_correct_token() {
     other.state.lock().unwrap().snapshot = Some(snapshot());
     assert!(rooms.join(&other_code, 0, None).is_ok());
     room.state.lock().unwrap().snapshot.as_mut().unwrap().locked = true;
-    assert!(rooms.join(&code, 1, None).is_err());
+    assert!(rooms.join(&code, 1, None).is_ok());
     assert!(room.command(0, &token, PhoneMessage::Leave).is_err());
 }
 

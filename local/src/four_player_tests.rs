@@ -77,9 +77,10 @@ fn four_humans_all_require_current_verification_and_fresh_funding() {
         for player in 0..3 {
             verify(&mut demo, player).await;
         }
-        assert!(demo.command(Command::Action(2)).await.is_err());
+        demo.command(Command::Action(2)).await.unwrap();
+        demo.reconcile().await.unwrap();
         assert!(demo.command(Command::Action(4)).await.is_err());
-        assert_eq!(demo.saved.pot.paid, [false; 4]);
+        assert_eq!(demo.saved.pot.paid, [true, false, false, false]);
         verify(&mut demo, 3).await;
         for player in 0..4 {
             assert!(demo.command(Command::Action(4)).await.is_err());

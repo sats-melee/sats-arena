@@ -638,12 +638,10 @@ impl Demo {
     }
 
     fn plan_entries(&mut self) {
-        if self.simulation.is_none()
-            && self.saved.pot.phase == Phase::Funding
-            && self.require_addresses().is_ok()
-        {
+        if self.simulation.is_none() && self.saved.pot.phase == Phase::Funding {
             for player in 0..4 {
                 if !self.saved.pot.participates(player)
+                    || self.require_address(player).is_err()
                     || self.saved.pot.paid[player]
                     || !self.saved.hashes[player].is_empty()
                 {

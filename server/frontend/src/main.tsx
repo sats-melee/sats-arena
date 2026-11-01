@@ -207,15 +207,15 @@ function App() {
     connected &&
     online &&
     snapshot &&
-    !snapshot.locked &&
+    !own?.paid_sats &&
     [1, 2].includes(snapshot.phase) &&
-    own?.kind === 0;
+    (own?.kind === 0 || own?.kind === 3);
   const canInvoice =
     connected &&
     online &&
     snapshot &&
     [1, 2].includes(snapshot.phase) &&
-    own?.kind === 0 &&
+    (own?.kind === 0 || own?.kind === 3) &&
     !own.paid_sats &&
     !!own.address;
   const activePlayers =
@@ -420,8 +420,8 @@ function App() {
                       </>
                     ) : (
                       <p className="muted">
-                        Waiting for the desktop invoice. Every participating
-                        receiver must be verified first.
+                        Waiting for the desktop to verify your address and create
+                        your invoice. You can pay before choosing a character.
                       </p>
                     )}
                   </div>

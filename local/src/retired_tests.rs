@@ -59,7 +59,8 @@ fn real_entry_invoices_are_not_created_until_receivers_are_verified() {
             .await
             .unwrap();
         reconcile_now(&mut demo).await;
-        assert!(demo.saved.hashes.iter().all(String::is_empty));
+        assert!(!demo.saved.hashes[0].is_empty());
+        assert!(demo.saved.hashes[1..].iter().all(String::is_empty));
         demo.command(Command::Address(1, "bob@example.test".into()))
             .await
             .unwrap();
@@ -365,6 +366,9 @@ fn unknown_retired_invoice_stays_monitored_without_blocking_other_returns_or_cur
             .unwrap();
         reconcile_now(&mut demo).await;
         wallet.unavailable.lock().unwrap().insert(old[0].clone());
+        demo.command(Command::Address(1, "dave@example.test".into()))
+            .await
+            .unwrap();
         fake.set_invoice_state(&old[1], InvoiceState::Paid { amount_sats: 500 });
         fake.set_invoice_state(
             &demo.saved.hashes[0],

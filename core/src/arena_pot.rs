@@ -189,15 +189,20 @@ impl MatchPot {
         Ok(())
     }
 
-    /// Only an unfunded lobby may change roster. Funded changes must first take
-    /// the no-contest return path, then use a new match and fresh entry invoices.
+    /// Before admission, unpaid slots may change while paid slots keep their terms.
     pub fn configure(
         &mut self,
         teams: bool,
         kinds: [u8; PLAYERS],
         team_ids: [u8; PLAYERS],
     ) -> Result<()> {
-        if self.phase != Phase::Funding || self.paid.iter().any(|&paid| paid) {
+        if !matches!(self.phase, Phase::Funding | Phase::Ready)
+            || self.paid.iter().enumerate().any(|(i, &paid)| {
+                paid && (self.teams != teams
+                    || self.kinds[i] != kinds[i]
+                    || self.team_ids[i] != team_ids[i])
+            })
+        {
             return Err(Error::Rejected("funded match roster is locked".into()));
         }
         let mut participants = 0;
@@ -228,6 +233,7 @@ impl MatchPot {
         self.teams = teams;
         self.kinds = kinds;
         self.team_ids = team_ids;
+        self.phase = Phase::Funding;
         self.update_funding_phase();
         Ok(())
     }

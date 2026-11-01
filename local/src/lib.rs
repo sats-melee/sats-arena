@@ -1044,6 +1044,23 @@ impl Demo {
                 }
                 if self.saved.pot.phase == Phase::Settling {
                     self.saved.next_roster = Some(roster);
+                } else if matches!(self.saved.pot.phase, Phase::Funding | Phase::Ready)
+                    && (self.saved.pot.paid.iter().any(|paid| *paid)
+                        || (self.saved.pot.teams == roster.teams
+                            && self.saved.pot.kinds == roster.kinds
+                            && self.saved.pot.team_ids == roster.team_ids))
+                    && self
+                        .saved
+                        .pot
+                        .configure(roster.teams, roster.kinds, roster.team_ids)
+                        .is_ok()
+                {
+                    for player in 0..4 {
+                        if !self.saved.pot.participates(player) && !self.saved.pot.paid[player] {
+                            self.retire_entry(player, None);
+                        }
+                    }
+                    self.saved.roster = Some(roster);
                 } else if self.saved.pot.paid.iter().any(|paid| *paid)
                     && self.saved.pot.phase != Phase::Settled
                 {
@@ -1070,7 +1087,7 @@ impl Demo {
                     ));
                 }
                 if !matches!(self.saved.pot.phase, Phase::Funding | Phase::Ready)
-                    || (self.saved.pot.paid.iter().any(|paid| *paid)
+                    || (self.saved.pot.paid[player]
                         && address.as_str() != self.saved.addresses[player])
                 {
                     return Err(Error::Rejected(
@@ -1078,7 +1095,7 @@ impl Demo {
                     ));
                 }
                 if self.simulation.is_none() && address.as_str() != self.saved.addresses[player] {
-                    self.retire_entries();
+                    self.retire_entry(player, None);
                 }
                 self.saved.addresses[player] = address.as_str().into();
                 self.saved.verification[player] = AddressCheck::default();
@@ -1134,7 +1151,7 @@ impl Demo {
                     } else {
                         (action - 7) as usize
                     };
-                    self.require_addresses()?;
+                    self.require_address(player)?;
                     if !self.saved.pot.participates(player) {
                         return Err(Error::Rejected("this player does not fund an entry".into()));
                     }
@@ -1222,29 +1239,31 @@ impl Demo {
         Ok(())
     }
     fn require_addresses(&self) -> Result<()> {
-        for (player, address) in self.saved.addresses.iter().enumerate() {
+        for player in 0..4 {
             if !self.saved.pot.participates(player) {
                 continue;
             }
-            parse_address(address)?;
-            let report = self.saved.verification[player]
-                .report
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::Rejected(format!(
-                        "Verify Player {} receiving address first",
-                        player + 1
-                    ))
-                })?;
-            if report.address != *address
-                || !report.fresh(now_ms())
-                || !self.supports_report(report)
-            {
-                return Err(Error::Rejected(format!(
-                    "Player {} needs current, compatible address verification",
+            self.require_address(player)?;
+        }
+        Ok(())
+    }
+    fn require_address(&self, player: usize) -> Result<()> {
+        let address = &self.saved.addresses[player];
+        parse_address(address)?;
+        let report = self.saved.verification[player]
+            .report
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Rejected(format!(
+                    "Verify Player {} receiving address first",
                     player + 1
-                )));
-            }
+                ))
+            })?;
+        if report.address != *address || !report.fresh(now_ms()) || !self.supports_report(report) {
+            return Err(Error::Rejected(format!(
+                "Player {} needs current, compatible address verification",
+                player + 1
+            )));
         }
         Ok(())
     }
@@ -1817,10 +1836,8 @@ impl Demo {
                 "Match changed; wait for the room to update".into(),
             ));
         }
-        if player >= 4 || self.saved.roster.is_none() || self.saved.pot.kinds[player] != 0 {
-            return Err(Error::Rejected(
-                "Select this human player in Melee first".into(),
-            ));
+        if player >= 4 || !matches!(self.saved.pot.kinds[player], 0 | 3) {
+            return Err(Error::Rejected("Choose a human player slot".into()));
         }
         if !matches!(self.saved.pot.phase, Phase::Funding | Phase::Ready) {
             return Err(Error::Rejected(
@@ -1829,7 +1846,7 @@ impl Demo {
         }
         match command {
             DesktopCommand::SetAddress { address, .. } => {
-                self.command(Command::Address(player, address)).await
+                self.command(Command::Address(player, address)).await?;
             }
             DesktopCommand::RequestInvoice { .. } => {
                 if self.saved.pot.paid[player] {
@@ -1840,18 +1857,23 @@ impl Demo {
                     return Err(Error::Rejected("Save your Lightning Address first".into()));
                 }
                 // Invoice creation/expiry stays in the existing wallet worker; this is a read request.
-                Ok(())
             }
         }
+        if self.saved.pot.kinds[player] == 3 {
+            let mut kinds = self.saved.pot.kinds;
+            kinds[player] = 0;
+            self.saved
+                .pot
+                .configure(self.saved.pot.teams, kinds, self.saved.pot.team_ids)?;
+            self.saved.roster = None;
+        }
+        self.save()
     }
 
     fn room_snapshot(&self) -> sats_arena_protocol::rooms::Snapshot {
         use sats_arena_protocol::rooms::{LogEntry, Player, Snapshot};
         let view = self.view().unwrap_or_default();
         let pot = &self.saved.pot;
-        let all_verified = (0..4)
-            .filter(|&i| pot.kinds[i] == 0 || (pot.cpu_wallets && pot.kinds[i] == 1))
-            .all(|i| view.verification_state[i] == 2);
         let locked = match pot.phase {
             Phase::Funding | Phase::Ready => pot.paid.iter().any(|paid| *paid),
             Phase::Playing | Phase::Settling => true,
@@ -1883,8 +1905,8 @@ impl Demo {
                         .unwrap_or_default(),
                 )
                 .into_owned(),
-                invoice: if self.saved.roster.is_some()
-                    && all_verified
+                invoice: if pot.participates(i)
+                    && view.verification_state[i] == 2
                     && !pot.paid[i]
                     && matches!(pot.phase, Phase::Funding | Phase::Ready)
                 {

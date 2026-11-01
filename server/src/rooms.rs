@@ -208,11 +208,11 @@ impl Rooms {
                 existing.clone()
             } else {
                 let snapshot = state.snapshot.as_ref().ok_or("Waiting for the desktop")?;
-                if snapshot.locked {
-                    return Err("Join before anyone pays entry");
+                if !matches!(snapshot.phase, 1 | 2) {
+                    return Err("Wait for the next match to join");
                 }
-                if !snapshot.roster_ready || snapshot.players[player].kind != 0 {
-                    return Err("Select this human player in Melee first");
+                if !matches!(snapshot.players[player].kind, 0 | 3) {
+                    return Err("Choose a human player slot");
                 }
                 let token = secret();
                 state.claims[player] = Some(token.clone());

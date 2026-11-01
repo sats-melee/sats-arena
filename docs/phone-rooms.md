@@ -66,15 +66,16 @@ this variable through its toggle.
 On the phone:
 
 1. Open the server website, enter the code, and select your P1–P4 controller slot.
-   That slot must already be a selected human in Melee.
+   You can join before selecting a character, including after another player pays.
 2. Save your receiving Lightning Address. The desktop performs its existing
    validation, including the fixed-address restriction in Sandbox.
 3. Choose **Get entry invoice**. The desktop returns its existing current entry
-   invoice when all participating receiving addresses are verified. Repeated
+   invoice once your receiving address is verified. Repeated
    requests do not replace invoices. Open your wallet or copy the invoice to pay.
 4. The desktop's usual incoming lookup confirms payment. The website cannot
    simulate funding or start a match. View damage and payment activity while
-   continuing to play with the controller.
+   continuing to play with the controller. Selecting or changing a character keeps
+   your paid entry; Start still requires a complete selected roster and all its payments.
 
 Existing rules still govern entry amounts, surcharge, admission, receiver locks,
 invoice expiry, payout batching and settlement. Phone requests include the
@@ -87,8 +88,9 @@ desktop, and the room server never asserts that an invoice was paid.
 Each native session creates its own random room code and a private desktop
 resume token. Slot claims are atomic and carry separate private resume tokens.
 Refreshing the phone restores its claim from browser storage; closing the page
-does not give its slot to someone else. **Leave room** releases it while the
-desktop reports addresses unlocked. Join all phones before paying entry.
+does not give its slot to someone else. **Leave room** releases it before the
+first entry payment. Each paid player's receiving address stays locked;
+unpaid players can still join and save theirs.
 The same room and claims survive consecutive matches and brief disconnections.
 
 Rooms are in memory. Disconnected desktop rooms can be resumed for ten minutes;

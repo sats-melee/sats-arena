@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phone_requests_reuse_entries_and_cannot_change_a_funded_or_stale_match() {
+    async fn phone_requests_preserve_paid_entries_and_allow_unpaid_players_to_join() {
         let dir = tempfile::tempdir().unwrap();
         let mut demo = Demo::open(dir.path()).await.unwrap();
         demo.command(Command::Roster(Roster {
@@ -254,17 +254,26 @@ mod tests {
         demo.command(Command::Action(2)).await.unwrap();
         demo.reconcile().await.unwrap();
         assert!(demo.room_snapshot().locked);
+        demo.room_command(DesktopCommand::SetAddress {
+            request_id: 8,
+            player: 1,
+            match_id: match_id.clone(),
+            address: "different@example.test".into(),
+        })
+        .await
+        .unwrap();
         assert!(
             demo.room_command(DesktopCommand::SetAddress {
-                request_id: 8,
-                player: 1,
+                request_id: 9,
+                player: 0,
                 match_id,
                 address: "different@example.test".into()
             })
             .await
             .is_err()
         );
-        assert_eq!(demo.saved.addresses[1], "player1@example.test");
+        assert_eq!(demo.saved.addresses[1], "different@example.test");
+        assert_eq!(demo.saved.invoices[0], invoice);
         assert!(demo.room_snapshot().players[0].invoice.is_empty());
     }
 }
