@@ -58,7 +58,10 @@ Copy command or **Open Lightning wallet**. HTTPS supports direct clipboard copyi
 Rebuild the launcher and native Dolphin with the updated local Rust library.
 In launcher settings, enable **Phone room**, save the room server's HTTPS origin,
 and open LOCAL. Changes apply on the next LOCAL launch.
-The native sidebar displays a six-character room code and the website address.
+The native sidebar prominently displays the website address, six-character room
+code, and total entry invoice, with the playable pot and fees shown underneath.
+For a loopback server URL, the website address uses the computer's network IP so
+phones on the same Wi-Fi can reach it; the desktop still connects over loopback.
 There is no room QR code. Direct native development can set
 `SATS_ARENA_ROOM_SERVER_URL=http://127.0.0.1:8738`; the launcher explicitly controls
 this variable through its toggle.

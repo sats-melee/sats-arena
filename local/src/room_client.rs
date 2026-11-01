@@ -2,6 +2,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sats_arena_protocol::rooms::{DesktopCommand, HostHello, HostMessage, ServerMessage, Snapshot};
 use std::{
+    net::UdpSocket,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -48,10 +49,34 @@ pub(super) fn websocket_url(server: &str) -> Result<String, &'static str> {
     Ok(url.into())
 }
 
+fn phone_url(server: &str) -> String {
+    let Ok(mut url) = url::Url::parse(server) else {
+        return server.to_owned();
+    };
+    if !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) {
+        return server.to_owned();
+    }
+    let address = (|| {
+        let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+        // Select the local network route without sending any packets.
+        socket.connect("192.0.2.1:80").ok()?;
+        socket.local_addr().ok()
+    })();
+    if let Some(address) = address
+        && !address.ip().is_loopback()
+        && !address.ip().is_unspecified()
+        && url.set_ip_host(address.ip()).is_ok()
+    {
+        return url.as_str().trim_end_matches('/').to_owned();
+    }
+    server.to_owned()
+}
+
 impl Bridge {
     pub fn start(server: &str, status: Arc<Mutex<String>>) -> Result<Self, &'static str> {
         let url = websocket_url(server)?;
         let server = server.trim_end_matches('/').to_owned();
+        let website = phone_url(&server);
         let (commands_tx, commands) = mpsc::channel(8);
         let (replies, mut replies_rx) = mpsc::channel::<HostMessage>(8);
         let (snapshots, mut snapshots_rx) = watch::channel::<Option<Snapshot>>(None);
@@ -88,7 +113,7 @@ impl Bridge {
                             token: assigned_token,
                         }) = greeting
                         {
-                            *status.lock().unwrap() = format!("Phone room {assigned} • {server}");
+                            *status.lock().unwrap() = format!("Phone room {assigned} • {website}");
                             code = Some(assigned);
                             token = Some(assigned_token);
                             // Responses from a previous socket cannot acknowledge a new request.
@@ -176,6 +201,15 @@ impl Bridge {
 mod tests {
     use super::*;
     use crate::{Command, Demo, Roster};
+    #[test]
+    fn phone_website_preserves_hosted_origins() {
+        for server in [
+            "https://arena.example.com",
+            "https://arena.example.com:9443",
+        ] {
+            assert_eq!(phone_url(server), server);
+        }
+    }
     #[test]
     fn only_credential_free_secure_origins_or_local_development_are_accepted() {
         assert_eq!(
