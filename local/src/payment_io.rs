@@ -1,9 +1,10 @@
 //! Network jobs return facts to the single ledger owner. They never mutate funds.
 use super::*;
-use sats_arena_core::wallet::{IncomingReceiptError, NewInvoice};
-use std::{future::Future, io::Write, time::Instant};
+use sats_arena_core::wallet::{IncomingReceiptError, NewInvoice, WalletIssue};
+use std::{future::Future, io::Write};
+use tokio::time::Instant;
 
-const MAX_PAYMENTS: usize = 2;
+const MAX_PAYMENTS: usize = 4;
 const MAX_PREPARATIONS: usize = 4;
 const MAX_LOOKUPS: usize = 2;
 const MAX_INCOMING: usize = 4;
@@ -32,7 +33,10 @@ enum Operation {
     },
     Incoming(String),
     Prepare(Target),
-    Submit(Target),
+    Submit {
+        target: Target,
+        address: String,
+    },
     Lookup(Target),
 }
 impl Operation {
@@ -42,7 +46,9 @@ impl Operation {
                 match_id, player, ..
             } => format!("entry-{match_id}-{player}"),
             Self::Incoming(hash) => format!("incoming-{hash}"),
-            Self::Prepare(t) | Self::Submit(t) | Self::Lookup(t) => format!("payout-{}", t.id()),
+            Self::Prepare(t) | Self::Lookup(t) | Self::Submit { target: t, .. } => {
+                format!("payout-{}", t.id())
+            }
         }
     }
     fn stage(&self) -> &'static str {
@@ -50,13 +56,13 @@ impl Operation {
             Self::Create { .. } => "entry_invoice",
             Self::Incoming(_) => "incoming_lookup",
             Self::Prepare(_) => "recipient_invoice",
-            Self::Submit(_) => "payment_submit",
+            Self::Submit { .. } => "payment_submit",
             Self::Lookup(_) => "payment_lookup",
         }
     }
     fn lane(&self) -> u8 {
         match self {
-            Self::Submit(_) => 0,
+            Self::Submit { .. } => 0,
             Self::Prepare(_) => 1,
             Self::Lookup(_) => 2,
             _ => 3,
@@ -71,10 +77,10 @@ impl Operation {
                 "Could not check an entry payment yet. Retrying automatically; do not pay again."
             }
             Self::Prepare(_) => {
-                "Could not request a receiving invoice. Retrying automatically; funds remain reserved."
+                "Could not request a receiving invoice; see missed payments. Funds remain reserved."
             }
-            Self::Submit(_) => {
-                "Waiting for wallet confirmation. Retrying automatically; funds remain reserved."
+            Self::Submit { .. } => {
+                "Waiting for wallet confirmation; checking the original payment. Funds remain reserved."
             }
             Self::Lookup(_) => {
                 "Could not check payout status. Retrying automatically; the original payment remains reserved."
@@ -99,6 +105,8 @@ struct VerificationJob {
 }
 #[derive(Default)]
 pub(super) struct PaymentIo {
+    pub(super) serialize_submissions: bool,
+    pub(super) track_missed: bool,
     active: BTreeMap<String, Active>,
     retry: BTreeMap<String, Instant>,
     waiting: BTreeMap<String, Instant>,
@@ -124,6 +132,25 @@ impl Drop for PaymentIo {
     }
 }
 impl PaymentIo {
+    pub(super) fn cancel_preparations(&mut self, ids: &[String]) {
+        for id in ids {
+            let key = format!("payout-{id}");
+            if self
+                .active
+                .get(&key)
+                .is_some_and(|j| matches!(j.operation, Operation::Prepare(_)))
+            {
+                self.active.remove(&key).unwrap().task.abort();
+            }
+            self.clear_retry(id);
+        }
+    }
+    pub(super) fn clear_retry(&mut self, id: &str) {
+        let key = format!("payout-{id}");
+        self.retry.remove(&key);
+        self.lookup_attempts.remove(&key);
+        self.errors.remove(&key);
+    }
     pub(super) fn set_submission_rate(&mut self, per_second: u32) -> Result<()> {
         if !(1..=20).contains(&per_second) {
             return Err(Error::Rejected(
@@ -141,12 +168,13 @@ impl PaymentIo {
             PayoutState::Paid => "Confirmed",
             PayoutState::Failed => "Failed; needs attention",
             PayoutState::Superseded => "Consolidated; this original payment will not be sent",
+            PayoutState::Discarded => "Discarded without sending; funds retained by host",
             PayoutState::Created if matches!(active, Some(Operation::Prepare(_))) => {
                 "Requesting receiving invoice"
             }
             PayoutState::Created if prepared => "Queued to send",
             PayoutState::Created => "Queued for receiving invoice",
-            PayoutState::InFlight if matches!(active, Some(Operation::Submit(_))) => "Sending",
+            PayoutState::InFlight if matches!(active, Some(Operation::Submit { .. })) => "Sending",
             PayoutState::InFlight if matches!(active, Some(Operation::Lookup(_))) => {
                 "Checking confirmation"
             }
@@ -184,7 +212,7 @@ impl PaymentIo {
             return false;
         }
         self.waiting.entry(key.clone()).or_insert_with(Instant::now);
-        if matches!(op, Operation::Submit(_))
+        if matches!(op, Operation::Submit { .. })
             && self.next_submit.is_some_and(|at| Instant::now() < at)
         {
             return false;
@@ -196,6 +224,7 @@ impl PaymentIo {
             .count();
         count
             < match op.lane() {
+                0 if self.serialize_submissions => 1,
                 0 => MAX_PAYMENTS,
                 1 => MAX_PREPARATIONS,
                 2 => MAX_LOOKUPS,
@@ -208,7 +237,7 @@ impl PaymentIo {
         future: impl Future<Output = anyhow::Result<Value>> + Send + 'static,
     ) {
         let key = op.key();
-        if matches!(op, Operation::Submit(_)) {
+        if matches!(op, Operation::Submit { .. }) {
             self.next_submit =
                 Some(Instant::now() + self.submit_interval.unwrap_or(Duration::from_secs(1)));
         }
@@ -240,11 +269,84 @@ fn millis(duration: Duration) -> u64 {
 }
 
 impl Demo {
+    pub(super) fn unsent_sats(&self) -> u64 {
+        std::iter::once(&self.saved)
+            .chain(self.saved.pending_matches.iter())
+            .map(|saved| {
+                saved.pot.unbatched.iter().sum::<u64>()
+                    + saved
+                        .pot
+                        .payouts
+                        .iter()
+                        .filter(|p| p.state == PayoutState::Created)
+                        .map(|p| p.sats)
+                        .sum::<u64>()
+            })
+            .sum::<u64>()
+            + self
+                .saved
+                .retired_entries
+                .iter()
+                .filter(|e| e.state == PayoutState::Created)
+                .map(|e| e.received_sats.unwrap_or(0))
+                .sum::<u64>()
+    }
+
+    pub(super) fn discard_unsent(&mut self) -> Result<()> {
+        let before = self.saved.clone();
+        let mut sats = self.saved.pot.discard_unsent();
+        for saved in &mut self.saved.pending_matches {
+            sats += saved.pot.discard_unsent();
+        }
+        let mut ids: Vec<_> = std::iter::once(&self.saved)
+            .chain(self.saved.pending_matches.iter())
+            .flat_map(|saved| {
+                saved
+                    .pot
+                    .payouts
+                    .iter()
+                    .filter(|p| p.state == PayoutState::Discarded)
+                    .map(|p| p.id.clone())
+            })
+            .collect();
+        for entry in &mut self.saved.retired_entries {
+            if entry.state == PayoutState::Created && entry.received_sats.is_some() {
+                sats += entry.received_sats.unwrap();
+                entry.state = PayoutState::Discarded;
+                ids.push(format!("late-entry-{}", entry.incoming_hash));
+            }
+        }
+        self.event(format!(
+            "Discarded {sats} unsent sats • retained in host wallet; submitted payments unchanged"
+        ));
+        if let Err(error) = self.save() {
+            self.saved = before;
+            return Err(error);
+        }
+        // Persist the discard before cancelling any invoice-only work.
+        for id in ids {
+            let key = format!("payout-{id}");
+            if let Some(job) = self.io.active.remove(&key) {
+                debug_assert!(matches!(job.operation, Operation::Prepare(_)));
+                job.task.abort();
+            }
+            self.io.ready_since.remove(&id);
+            self.io.errors.remove(&key);
+            self.io.retry.remove(&key);
+            self.io.waiting.remove(&key);
+        }
+        Ok(())
+    }
+
     /// Only Created intents can be replaced. Their optional invoice-resolution
     /// tasks cannot spend funds and are cancelled after the replacement is saved.
     pub(super) fn consolidate_outbound(&mut self) -> Result<()> {
         let mut replacements = Vec::new();
-        if self.saved.pot.consolidate_created() {
+        if self
+            .saved
+            .pot
+            .consolidate_created_except(&self.saved.held_payouts())
+        {
             replacements.extend(
                 self.saved
                     .pot
@@ -254,7 +356,7 @@ impl Demo {
             );
         }
         for saved in &mut self.saved.pending_matches {
-            if saved.pot.consolidate_created() {
+            if saved.pot.consolidate_created_except(&saved.held_payouts()) {
                 replacements.extend(
                     saved
                         .pot
@@ -377,8 +479,19 @@ impl Demo {
             options.mode(0o600);
         }
         if let Ok(mut file) = options.open(path) {
+            let id = key.strip_prefix("payout-").unwrap_or(key);
+            let attempt = self
+                .recovery(id)
+                .map(|r| {
+                    let already_failed = self
+                        .payment_details(id)
+                        .and_then(|(_, _, p)| p)
+                        .is_some_and(|p| r.confirmed_failed(&p));
+                    r.failed.len() + usize::from(!already_failed || stage == "recipient_invoice")
+                })
+                .unwrap_or(1);
             let line = serde_json::json!({"at_ms": started_at_ms.saturating_add(elapsed_ms), "started_at_ms": started_at_ms, "observed_at_ms": now_ms(), "id": key, "stage": stage,
-                "elapsed_ms": elapsed_ms, "queued_ms": queued_ms, "result": result});
+                "elapsed_ms": elapsed_ms, "queued_ms": queued_ms, "result": result, "attempt": attempt, "transfer_id": self.payout_owner(id).and_then(|o| o.group_leader(id)).unwrap_or(id)});
             let _ = writeln!(file, "{line}");
         }
     }
@@ -414,24 +527,38 @@ impl Demo {
                 outcome,
                 started_at_ms,
             );
-            // Poll uncertain payments and incoming receipts with a backoff.
-            // A successful preparation can advance to submission immediately.
-            let delay = if matches!(&result, Ok(Value::Prepared(_)) | Ok(Value::Invoice(_))) {
+            // Back off failed lookups, not a wallet's healthy processing response.
+            // An uncertain send can be checked immediately without sending again.
+            let delay = if matches!(&result, Ok(Value::Prepared(_)) | Ok(Value::Invoice(_)))
+                || (matches!(job.operation, Operation::Submit { .. })
+                    && matches!(&result, Ok(Value::Payment(PaymentState::Pending)) | Err(_)))
+            {
                 Duration::ZERO
-            } else if matches!(job.operation, Operation::Lookup(_))
-                && !matches!(
-                    &result,
-                    Ok(Value::Payment(
-                        PaymentState::Succeeded { .. } | PaymentState::Failed { .. }
-                    ))
-                )
+            } else if matches!(
+                job.operation,
+                Operation::Lookup(_)
+                    | Operation::Prepare(_)
+                    | Operation::Create { .. }
+                    | Operation::Incoming(_)
+            ) && result.is_err()
             {
                 let attempts = self.io.lookup_attempts.entry(key.clone()).or_default();
                 *attempts = attempts.saturating_add(1);
                 Duration::from_secs((2u64 << (*attempts - 1).min(4)).min(30))
             } else {
                 self.io.lookup_attempts.remove(&key);
-                RETRY
+                if matches!(&job.operation, Operation::Incoming(hash) if self.saved.retired_entries.iter().any(|entry| &entry.incoming_hash == hash))
+                {
+                    // Keep late-payment recovery, without continuously polling
+                    // abandoned invoices throughout every subsequent game.
+                    if matches!(&result, Ok(Value::Incoming(InvoiceState::Expired))) {
+                        Duration::from_secs(300)
+                    } else {
+                        Duration::from_secs(30)
+                    }
+                } else {
+                    RETRY
+                }
             };
             self.io.retry.insert(key.clone(), Instant::now() + delay);
             match self.apply_result(&job.operation, result) {
@@ -489,7 +616,7 @@ impl Demo {
             }
         }
         for entry in &self.saved.retired_entries {
-            if entry.state != PayoutState::Paid {
+            if !entry.state.complete() {
                 current_keys.insert(format!("payout-late-entry-{}", entry.incoming_hash));
                 current_keys.insert(format!("incoming-{}", entry.incoming_hash));
             }
@@ -500,7 +627,11 @@ impl Demo {
         self.io
             .lookup_attempts
             .retain(|key, _| current_keys.contains(key));
-        if let Some(message) = self.io.errors.values().next() {
+        if let Some((_, message)) = self.io.errors.iter().find(|(key, _)| {
+            !key.strip_prefix("payout-")
+                .and_then(|id| self.recovery(id))
+                .is_some_and(|r| r.missed)
+        }) {
             return Err(Error::Rejected(message.clone()));
         }
         Ok(())
@@ -561,7 +692,7 @@ impl Demo {
             self.retired_cursor = (self.retired_cursor + 1) % count;
             let entry = &self.saved.retired_entries[index];
             if entry.received_sats.is_none()
-                && entry.state != PayoutState::Paid
+                && !entry.state.complete()
                 && self.plan_incoming(entry.incoming_hash.clone())
             {
                 self.io.retired_budget -= 1;
@@ -588,7 +719,11 @@ impl Demo {
                 saved.pot.payouts.iter().map(|payout| {
                     (
                         payout.clone(),
-                        saved.addresses[payout.player].clone(),
+                        saved
+                            .prepared
+                            .get(&payout.id)
+                            .map(|p| p.address.clone())
+                            .unwrap_or_else(|| saved.addresses[payout.player].clone()),
                         payout_memo(&saved.pot, payout),
                         saved.prepared.get(&payout.id).cloned(),
                     )
@@ -616,18 +751,38 @@ impl Demo {
             if payout.state.complete() {
                 continue;
             }
-            let target = Target::Match(payout.id.clone());
-            if payout.state == PayoutState::Failed {
-                self.io.errors.insert(
-                    format!("payout-{}", payout.id),
-                    "Payout failed; needs attention".into(),
-                );
+            let owner = self.payout_owner(&payout.id).ok_or(Error::NotFound)?;
+            if owner
+                .group_leader(&payout.id)
+                .is_some_and(|leader| leader != payout.id)
+            {
                 continue;
             }
+            let sats = owner.group_sats(&payout.id).unwrap_or(payout.sats);
+            let memo = if let Some(members) = owner.payout_groups.get(&payout.id) {
+                format!(
+                    "Sats Melee — Missed payouts: {}",
+                    owner
+                        .pot
+                        .payouts
+                        .iter()
+                        .filter(|p| members.contains(&p.id))
+                        .map(|p| format!(
+                            "P{} {}",
+                            p.player + 1,
+                            payout_memo(&owner.pot, p).trim_start_matches("Sats Melee — ")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            } else {
+                memo
+            };
+            let target = Target::Match(payout.id.clone());
             self.plan_payment(
                 target,
                 payout.player,
-                payout.sats,
+                sats,
                 address,
                 memo,
                 payout.state,
@@ -639,7 +794,7 @@ impl Demo {
             let Some(sats) = entry.received_sats else {
                 continue;
             };
-            if entry.state == PayoutState::Paid {
+            if entry.state.complete() {
                 continue;
             }
             if sats == 0 {
@@ -648,13 +803,6 @@ impl Demo {
                 continue;
             }
             let target = Target::Late(entry.incoming_hash.clone());
-            if entry.state == PayoutState::Failed {
-                self.io.errors.insert(
-                    format!("payout-{}", target.id()),
-                    "A late entry return failed and needs attention".into(),
-                );
-                continue;
-            }
             self.io
                 .ready_since
                 .entry(target.id())
@@ -682,10 +830,56 @@ impl Demo {
         state: PayoutState,
         prepared: Option<PreparedPayout>,
     ) -> Result<()> {
-        let op = if prepared.is_none() {
+        let recovery = self.recovery(&target.id()).cloned().unwrap_or_default();
+        let proven_failure = prepared
+            .as_ref()
+            .is_some_and(|p| recovery.confirmed_failed(p))
+            || recovery.retry_prepared;
+        if state == PayoutState::Failed && proven_failure && !recovery.retry_due() {
+            return Ok(());
+        }
+        let retrying = state == PayoutState::Failed && proven_failure;
+        let sendable = state == PayoutState::Created || retrying;
+        if sendable && recovery.missed && !recovery.manual_ready {
+            return Ok(());
+        }
+        let prepare_new = prepared.is_none() || (retrying && !recovery.retry_prepared);
+        if state == PayoutState::Failed && !proven_failure && prepared.is_none() {
+            return Ok(()); // No original hash to reconcile; never guess a replacement.
+        }
+        // Keep live damage batched while this match's receiver is still processing.
+        // Final unsent amounts are independent debts; an unknown earlier send
+        // must not hold them indefinitely or cause its own hash to be replaced.
+        // Older uncertain matches must not block a fresh match's own payouts.
+        let processing = sendable
+            && match &target {
+                Target::Match(id) => self.payout_owner(id).is_some_and(|owner| {
+                    owner.pot.phase != Phase::Settling
+                        && owner.pot.payouts.iter().any(|p| {
+                            p.state == PayoutState::InFlight
+                                && !owner.recovery.get(&p.id).is_some_and(|r| r.missed)
+                                && owner
+                                    .prepared
+                                    .get(&p.id)
+                                    .is_some_and(|invoice| invoice.address == address)
+                        })
+                }),
+                Target::Late(_) => false,
+            };
+        if sendable
+            && (processing || self.io.active.values().any(|job| {
+                matches!(&job.operation, Operation::Submit { address: active, .. } if active == &address)
+            }))
+        {
+            return Ok(());
+        }
+        let op = if prepare_new {
             Operation::Prepare(target.clone())
-        } else if state == PayoutState::Created {
-            Operation::Submit(target.clone())
+        } else if sendable {
+            Operation::Submit {
+                target: target.clone(),
+                address: address.clone(),
+            }
         } else {
             Operation::Lookup(target.clone())
         };
@@ -693,9 +887,10 @@ impl Demo {
             return Ok(());
         }
         let wallet = self.wallet.clone();
-        if let Some(prepared) = prepared {
+        if !prepare_new {
+            let prepared = prepared.ok_or(Error::NotFound)?;
             let fees = self.saved.max_fee_sats;
-            if state == PayoutState::Created {
+            if sendable {
                 match &target {
                     Target::Match(id) => {
                         let owner = self.payout_owner_mut(id)?;
@@ -705,7 +900,25 @@ impl Demo {
                             .iter()
                             .position(|p| &p.id == id)
                             .ok_or(Error::NotFound)?;
-                        owner.pot.begin_payout(index)?;
+                        if retrying {
+                            if owner.pot.payouts[index].state != PayoutState::Failed {
+                                return Err(Error::Rejected("Retry is no longer eligible".into()));
+                            }
+                            owner.pot.payouts[index].state = PayoutState::InFlight;
+                        } else {
+                            owner.pot.begin_payout(index)?;
+                        }
+                        if let Some(members) = owner.payout_groups.get(id).cloned() {
+                            for member in members.iter().filter(|member| *member != id) {
+                                let part = owner
+                                    .pot
+                                    .payouts
+                                    .iter_mut()
+                                    .find(|p| p.id == *member)
+                                    .ok_or(Error::NotFound)?;
+                                part.state = PayoutState::InFlight;
+                            }
+                        }
                     }
                     Target::Late(hash) => {
                         let entry = self
@@ -716,6 +929,20 @@ impl Demo {
                             .ok_or(Error::NotFound)?;
                         entry.state = PayoutState::InFlight;
                     }
+                }
+                if self.recovery(&target.id()).is_some() {
+                    let record = self.recovery_mut(&target.id())?;
+                    record.issue = None;
+                    record.retry_at_ms = None;
+                    record.retry_prepared = false;
+                }
+                self.recovery_mut(&target.id())?.submitted_at_ms = Some(now_ms());
+                if retrying {
+                    let attempt = recovery.failed.len() + 1;
+                    self.event(format!(
+                        "Retry {attempt} of {}: sending {sats} sats still owed to {address}",
+                        recovery.limit
+                    ));
                 }
                 self.save()?; // Invoice/hash and InFlight must be durable before dispatch.
                 let queued_ms = self
@@ -761,7 +988,11 @@ impl Demo {
                 }
             };
             let provider = self.provider.clone();
-            let id = target.id();
+            let id = if retrying {
+                format!("{}-attempt-{}", target.id(), recovery.failed.len() + 1)
+            } else {
+                target.id()
+            };
             self.io.spawn(op, async move {
                 Ok(Value::Prepared(
                     prepare_payout_with_comment(
@@ -780,11 +1011,39 @@ impl Demo {
     }
 
     fn apply_result(&mut self, op: &Operation, result: anyhow::Result<Value>) -> Result<()> {
+        if let Operation::Prepare(target)
+        | Operation::Submit { target, .. }
+        | Operation::Lookup(target) = op
+        {
+            let pending_stalled = self
+                .recovery(&target.id())
+                .and_then(|r| r.submitted_at_ms)
+                .is_none_or(|at| now_ms().saturating_sub(at) >= 12_000);
+            if result.is_err()
+                || matches!(&result, Ok(Value::Payment(PaymentState::Failed { .. })))
+                || (pending_stalled && matches!(&result, Ok(Value::Payment(PaymentState::Pending))))
+            {
+                self.mark_missed(&target.id())?;
+            }
+        }
+        if let Err(error) = &result {
+            match op {
+                Operation::Submit { target, .. } | Operation::Lookup(target) => {
+                    self.record_issue(&target.id(), error)?
+                }
+                Operation::Prepare(target) => {
+                    self.record_issue(&target.id(), &WalletIssue::ReceivingInvoice.into())?
+                }
+                _ => (),
+            }
+        }
         let value = match result {
             Ok(value) => value,
             // Submission may have reached the wallet. Its durable InFlight state
             // makes the next operation a lookup, even after a timeout or crash.
-            Err(_) if matches!(op, Operation::Submit(_)) => Value::Payment(PaymentState::Pending),
+            Err(_) if matches!(op, Operation::Submit { .. }) => {
+                Value::Payment(PaymentState::Pending)
+            }
             Err(_) if matches!(op, Operation::Incoming(hash) if self.saved.retired_entries.iter().any(|e| &e.incoming_hash == hash)) =>
             {
                 return Ok(());
@@ -851,6 +1110,16 @@ impl Demo {
             (Operation::Incoming(hash), Value::Incoming(state)) => {
                 self.apply_incoming(hash, state)?
             }
+            (Operation::Lookup(target), Value::Payment(PaymentState::Pending)) => {
+                if self.recovery(&target.id()).and_then(|r| r.issue).is_some() {
+                    self.recovery_mut(&target.id())?.issue = None;
+                    if let Some((sats, address, _)) = self.payment_details(&target.id()) {
+                        self.event(format!(
+                            "{sats} sats to {address}: wallet reports processing; still owed"
+                        ));
+                    }
+                }
+            }
             (Operation::Prepare(target), Value::Prepared(prepared)) => {
                 if self
                     .saved
@@ -867,7 +1136,14 @@ impl Demo {
                             .pot
                             .payouts
                             .iter()
-                            .any(|p| &p.id == id && p.state == PayoutState::Created)
+                            .any(|p| {
+                                &p.id == id
+                                    && (p.state == PayoutState::Created
+                                        || (p.state == PayoutState::Failed
+                                            && self.recovery(id).is_some_and(|r| {
+                                                r.retry_due() && !r.retry_prepared
+                                            })))
+                            })
                         {
                             return Err(Error::Rejected("Stale payout preparation".into()));
                         }
@@ -879,6 +1155,20 @@ impl Demo {
                             .used_payment_hashes
                             .insert(prepared.payment_hash.clone());
                         owner.prepared.insert(id.clone(), prepared);
+                        if let Some(members) = owner.payout_groups.get(id).cloned() {
+                            let invoice = owner.prepared[id].clone();
+                            for member in members.iter().filter(|member| *member != id) {
+                                owner.prepared.insert(member.clone(), invoice.clone());
+                            }
+                        }
+                        if owner
+                            .pot
+                            .payouts
+                            .iter()
+                            .any(|p| &p.id == id && p.state == PayoutState::Failed)
+                        {
+                            owner.recovery.entry(id.clone()).or_default().retry_prepared = true;
+                        }
                     }
                     Target::Late(hash) => {
                         let entry = self
@@ -887,19 +1177,28 @@ impl Demo {
                             .iter_mut()
                             .find(|e| &e.incoming_hash == hash)
                             .ok_or(Error::NotFound)?;
-                        if entry.state != PayoutState::Created {
+                        let retrying = entry.state == PayoutState::Failed;
+                        if entry.state != PayoutState::Created && !retrying {
                             return Err(Error::Rejected("Stale entry return preparation".into()));
                         }
                         self.saved
                             .used_payment_hashes
                             .insert(prepared.payment_hash.clone());
                         entry.prepared = Some(prepared);
+                        if retrying {
+                            self.saved
+                                .recovery
+                                .entry(target.id())
+                                .or_default()
+                                .retry_prepared = true;
+                        }
                     }
                 }
             }
-            (Operation::Submit(target) | Operation::Lookup(target), Value::Payment(state)) => {
-                self.apply_payment(target, state)?
-            }
+            (
+                Operation::Submit { target, .. } | Operation::Lookup(target),
+                Value::Payment(state),
+            ) => self.apply_payment(target, state)?,
             _ => return Err(Error::Rejected("Unexpected wallet job response".into())),
         }
         self.save()
@@ -937,7 +1236,7 @@ impl Demo {
             .iter_mut()
             .find(|e| e.incoming_hash == hash)
             && entry.received_sats.is_none()
-            && entry.state != PayoutState::Paid
+            && !entry.state.complete()
             && let InvoiceState::Paid { amount_sats } = state
         {
             entry.received_sats = Some(amount_sats);
@@ -951,10 +1250,81 @@ impl Demo {
         Ok(())
     }
     fn apply_payment(&mut self, target: &Target, state: PaymentState) -> Result<()> {
+        if let Target::Match(id) = target {
+            let members = self
+                .payout_owner(id)
+                .and_then(|o| o.payout_groups.get(id))
+                .cloned();
+            if let Some(members) = members {
+                match &state {
+                    PaymentState::Pending => return Ok(()),
+                    PaymentState::Failed { reason } => {
+                        let owner = self.payout_owner_mut(id)?;
+                        for member in &members {
+                            let part = owner
+                                .pot
+                                .payouts
+                                .iter_mut()
+                                .find(|p| p.id == *member)
+                                .ok_or(Error::NotFound)?;
+                            if part.state == PayoutState::Paid {
+                                return Err(Error::Rejected(
+                                    "A paid transfer cannot fail later".into(),
+                                ));
+                            }
+                            part.state = PayoutState::Failed;
+                            let r = owner.recovery.entry(member.clone()).or_default();
+                            r.missed = true;
+                            r.manual_ready = false;
+                        }
+                        return self.record_failure(id, reason);
+                    }
+                    PaymentState::Succeeded { .. } => {
+                        for member in members {
+                            self.apply_payment_single(&Target::Match(member), state.clone())?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        self.apply_payment_single(target, state)
+    }
+    fn apply_payment_single(&mut self, target: &Target, state: PaymentState) -> Result<()> {
         if matches!(state, PaymentState::Pending) {
             return Ok(());
         }
         let id = target.id();
+        if let PaymentState::Failed { reason } = &state {
+            match target {
+                Target::Match(id) => {
+                    let owner = self.payout_owner_mut(id)?;
+                    let payout = owner
+                        .pot
+                        .payouts
+                        .iter_mut()
+                        .find(|p| &p.id == id)
+                        .ok_or(Error::NotFound)?;
+                    if payout.state == PayoutState::Paid {
+                        return Ok(());
+                    }
+                    payout.state = PayoutState::Failed;
+                }
+                Target::Late(hash) => {
+                    let entry = self
+                        .saved
+                        .retired_entries
+                        .iter_mut()
+                        .find(|e| &e.incoming_hash == hash)
+                        .ok_or(Error::NotFound)?;
+                    if entry.state == PayoutState::Paid {
+                        return Ok(());
+                    }
+                    entry.state = PayoutState::Failed;
+                }
+            }
+            return self.record_failure(&id, reason);
+        }
         let at_ms = now_ms();
         let receipt = match target {
             Target::Match(id) => {
@@ -968,10 +1338,9 @@ impl Demo {
                 if owner.pot.payouts[index].state == PayoutState::Paid {
                     return Ok(());
                 }
-                if let PaymentState::Failed { reason } = state {
-                    owner.pot.payouts[index].state = PayoutState::Failed;
-                    self.save()?;
-                    return Err(Error::Rejected(reason));
+                // Reconciliation may prove an old locally-Failed attempt actually paid.
+                if owner.pot.payouts[index].state == PayoutState::Failed {
+                    owner.pot.payouts[index].state = PayoutState::InFlight;
                 }
                 owner.pot.confirm_payout(index)?;
                 let payout = &owner.pot.payouts[index];
@@ -1002,14 +1371,7 @@ impl Demo {
                 if entry.state == PayoutState::Paid {
                     return Ok(());
                 }
-                if let PaymentState::Failed { .. } = state {
-                    entry.state = PayoutState::Failed;
-                    self.save()?;
-                    return Err(Error::Rejected(
-                        "A late entry return failed and needs attention".into(),
-                    ));
-                }
-                if entry.state != PayoutState::InFlight {
+                if !matches!(entry.state, PayoutState::InFlight | PayoutState::Failed) {
                     return Err(Error::Rejected("Entry return was not submitted".into()));
                 }
                 entry.state = PayoutState::Paid;
@@ -1030,6 +1392,13 @@ impl Demo {
                 }
             }
         };
+        if self.recovery(&id).is_some() {
+            let record = self.recovery_mut(&id)?;
+            record.issue = None;
+            record.retry_at_ms = None;
+            record.missed = false;
+            record.manual_ready = false;
+        }
         if let Some(previous) = self
             .saved
             .pending_matches
@@ -1113,6 +1482,29 @@ impl Demo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn discard_cancels_invoice_preparation_before_it_can_advance_to_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut demo = Demo::open(dir.path()).await.unwrap();
+        demo.saved.pot.confirm_entry(0, 500).unwrap();
+        demo.saved.pot.confirm_entry(1, 500).unwrap();
+        demo.saved.pot.start().unwrap();
+        demo.saved.pot.credit_at([0, 1000], now_ms()).unwrap();
+        demo.saved.pot.flush_due(u64::MAX);
+        let id = demo.saved.pot.payouts[0].id.clone();
+        demo.io.spawn(
+            Operation::Prepare(Target::Match(id)),
+            std::future::pending::<anyhow::Result<Value>>(),
+        );
+        assert_eq!(demo.io.active.len(), 1);
+        demo.command(Command::Action(14)).await.unwrap();
+        assert!(demo.io.active.is_empty());
+        demo.reconcile().await.unwrap();
+        assert_eq!(demo.simulation.as_ref().unwrap().payment_attempts(), 0);
+        assert_eq!(demo.saved.pot.discarded_sats(), 10);
+        assert!(demo.saved.receipts.is_empty());
+    }
+
     #[tokio::test]
     async fn lookup_error_is_retryable_and_never_credits_or_exposes_provider_data() {
         let dir = tempfile::tempdir().unwrap();

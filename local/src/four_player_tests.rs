@@ -57,7 +57,8 @@ fn conserved(demo: &Demo) {
     assert_eq!(
         p.remaining.iter().sum::<u64>()
             + p.earned.iter().sum::<u64>()
-            + p.pending().iter().sum::<u64>(),
+            + p.pending().iter().sum::<u64>()
+            + p.discarded_sats(),
         p.paid.iter().filter(|&&paid| paid).count() as u64 * p.entry_sats
     );
 }
@@ -140,6 +141,24 @@ fn financial_cpu_uses_normal_entry_admission_credits_and_confirmed_payouts() {
 }
 
 #[test]
+fn cpu_can_use_an_address_previously_entered_for_a_human() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut demo = Demo::open(dir.path()).await.unwrap();
+        verify(&mut demo, 0).await;
+        verify(&mut demo, 1).await;
+        demo.command(Command::Roster(roster(false, [1, 0, 3, 3], [255; 4])))
+            .await
+            .unwrap();
+        demo.saved.pot.set_cpu_wallets(true).unwrap();
+        assert_eq!(demo.saved.addresses[0], "player1@example.test");
+        assert_eq!(demo.view().unwrap().verification_state[0], 2);
+        assert!(demo.require_addresses().is_ok());
+        assert!(demo.saved.pot.participates(0));
+    });
+}
+
+#[test]
 fn expired_or_incompatible_fourth_receiver_blocks_a_fully_paid_lobby() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
@@ -206,10 +225,10 @@ fn four_player_ffa_sequences_pay_exact_recipients_and_log_winner() {
         assert_eq!(demo.saved.pot.phase, Phase::Playing);
         assert_eq!(demo.saved.receipts.len(), 2);
         assert!(
-            log(&demo).contains("Player 1 received 8 sats • damage payout → player1@example.test")
+            log(&demo).contains("Player 1 received 8 sats • Damage to P3 → player1@example.test")
         );
         assert!(
-            log(&demo).contains("Player 4 received 12 sats • damage payout → player4@example.test")
+            log(&demo).contains("Player 4 received 12 sats • Damage to P2 → player4@example.test")
         );
         demo.command(Command::Action(11)).await.unwrap(); // P3
         demo.reconcile().await.unwrap();
@@ -217,7 +236,7 @@ fn four_player_ffa_sequences_pay_exact_recipients_and_log_winner() {
         assert_eq!(demo.saved.pot.phase, Phase::Settled);
         assert!(log(&demo).contains("Player 3 wins"));
         assert!(
-            log(&demo).contains("Player 3 received 1980 sats • match won → player3@example.test")
+            log(&demo).contains("Player 3 received 1980 sats • Match won → player3@example.test")
         );
         assert_eq!(
             demo.saved
@@ -306,7 +325,7 @@ fn team_match_excludes_cpu_and_friendly_fire_and_logs_the_winning_team() {
                 .find(|r| r.player == 0)
                 .unwrap()
                 .memo,
-            "Sats Melee — Damage payout"
+            "Sats Melee — Damage to P2"
         );
         conserved(&demo);
     });
@@ -537,7 +556,7 @@ fn schema_two_migration_preserves_two_player_funds_payout_ids_and_fractional_dam
         .unwrap();
         drop(original);
         let mut migrated = Demo::open(dir.path()).await.unwrap();
-        assert_eq!(migrated.saved.schema, 4);
+        assert_eq!(migrated.saved.schema, 5);
         assert_eq!(migrated.saved.pot.id, old_id);
         assert_eq!(migrated.saved.pot.kinds, [0, 0, 3, 3]);
         assert_eq!(migrated.saved.pot.paid, [true, true, false, false]);
@@ -571,7 +590,7 @@ fn schema_two_migration_preserves_two_player_funds_payout_ids_and_fractional_dam
 }
 
 #[test]
-fn activity_is_chronological_within_session_and_restart_starts_a_new_log() {
+fn activity_is_chronological_and_survives_restart() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
         let mut demo = Demo::open(dir.path()).await.unwrap();
@@ -594,10 +613,12 @@ fn activity_is_chronological_within_session_and_restart_starts_a_new_log() {
         fund_humans(&mut demo).await;
         let lines = log(&demo);
         let first_invoice = lines.find("Player 1 Invoice Paid — 500 sats").unwrap();
-        let damage = lines.find("Player 1 received 8 sats • damage").unwrap();
+        let damage = lines
+            .find("Player 1 received 8 sats • Damage to P2")
+            .unwrap();
         let winner = lines.find("Player 2 wins").unwrap();
         let settlement = lines
-            .find("Player 2 received 992 sats • match won")
+            .find("Player 2 received 992 sats • Match won")
             .unwrap();
         let next_invoice = lines.rfind("Player 1 Invoice Paid — 500 sats").unwrap();
         assert!(
@@ -614,23 +635,23 @@ fn activity_is_chronological_within_session_and_restart_starts_a_new_log() {
         let invoices = demo.saved.invoices.clone();
         drop(demo);
         let mut recovered = Demo::open(dir.path()).await.unwrap();
-        assert!(log(&recovered).is_empty());
-        assert!(recovered.saved.activity.is_empty());
+        assert_eq!(log(&recovered), lines);
+        assert!(!recovered.saved.activity.is_empty());
         assert!(recovered.saved.events.is_empty());
         assert_eq!(recovered.saved.receipts.len(), receipt_count);
         assert_eq!(recovered.saved.used_payment_hashes, payout_ids);
         assert_eq!(recovered.saved.pot.paid, paid);
         assert_eq!(recovered.saved.invoices, invoices);
         recovered.reconcile().await.unwrap();
-        assert!(log(&recovered).is_empty());
+        assert_eq!(log(&recovered), lines);
         assert_eq!(recovered.simulation.as_ref().unwrap().payment_attempts(), 0);
         recovered.command(Command::Action(4)).await.unwrap();
         recovered.command(Command::Action(8)).await.unwrap();
         recovered.reconcile().await.unwrap();
         let new_log = log(&recovered);
         assert!(new_log.contains("No contest"));
-        assert!(!new_log.contains("Invoice Paid"));
-        assert!(!new_log.contains("damage"));
+        assert!(new_log.contains("Invoice Paid"));
+        assert!(new_log.contains("Damage to P2"));
         assert_eq!(recovered.saved.receipts.len(), receipt_count + 2);
         conserved(&recovered);
     });

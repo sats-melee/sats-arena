@@ -117,15 +117,30 @@ the wallet's confirmed outgoing transaction state.
 unknown/lost responses remain pending and recovered intents are looked up rather
 than sent again. Ambiguous outcomes never release funds for a replacement payout.
 
-## State and late payments
+Failed payouts leave a persistent visible note naming the amount, receiving
+address and reason. Match activity records failures, retries and confirmed
+receipts. Repeated identical status failures do not flood the log. A queued
+cancellation says refunds are being sent; it does not claim they have arrived.
 
-After the game ends, unresolved payouts move into durable `pending_matches`
-snapshots. A new game requires fresh entries and can proceed while those earlier
-payouts recover. Each snapshot keeps the original pot, recipients, invoices and
-receipts. InFlight payments are looked up by their original hash, never resent
-because of a timeout. Failed or unknown payouts keep their reserved amount and
-remain visible without blocking the current match. Settled recovery snapshots
-are archived only after their receipts have been persisted.
+For NWC and Sandbox, failed invoice requests, terminal failures and payments
+unconfirmed after 12 seconds go on the **Missed** list. Later live payouts keep
+running, including to the same address. Missed Created intents are pinned so
+normal damage consolidation cannot accidentally retry them.
+
+After the owning match finishes, **Pay missed payments** (action 16) combines
+never-submitted and proven-failed amounts by destination within each match.
+`payout_groups` binds a physical transfer leader to logical payout allocations;
+the exact total is invoiced once, while per-player amounts and receipts remain
+unchanged. All members enter InFlight durably before dispatch, share the original
+hash, and reconcile as one transfer. Ledger schema 5 prevents older hosts from
+misreading grouped invoices. ABI 13 exposes missed totals and the visible list.
+
+Unknown original sends are excluded, retain their reserves, and continue status
+checks without resubmission. Failed manual attempts wait for another click.
+Groups, missed status and attempts survive restart and the next lobby. Earlier
+finished matches recover in the background without blocking fresh admission;
+settled snapshots are archived only after receipts are durable. Legacy action 15
+cannot bypass the manual policy for missed records.
 
 Default paths are `<Dolphin user>/SatsArenaFake/` and
 `<Dolphin user>/SatsArenaLive/<public-connection-fingerprint>/`.
@@ -147,11 +162,27 @@ confirmation. Keep the arena host running to process those returns.
 
 The coordinator owns all accounting and durable writes. It runs a continuous
 async runtime, publishes snapshots on a 20 ms tick, and accepts damage credits
-while network jobs are in flight. Up to four payout jobs and four incoming
-invoice/receipt jobs run concurrently. A slow recipient does not serialize the
-other recipients. The configured damage window remains unchanged. Old incoming
-invoice monitoring has a global budget of four requests per two seconds; history
-growth does not multiply the polling rate.
+while network jobs are in flight. NWC queues one submission at a time from its
+shared sending wallet; other backends support up to four concurrent sends, with
+one active send per receiving address. Invoice preparation, confirmation and
+incoming-receipt checks continue independently while a submission awaits its
+reply. Within a match, further damage to an address accumulates in one
+unsent batch until that address's submitted payment is resolved. At match end,
+separate unsent final amounts may proceed while an earlier unknown payment keeps
+its original hash and reservation. Older recovering matches do not block a fresh
+match's own payouts. The configured
+starts-per-second limit and damage window still apply.
+An uncertain submission is looked up immediately by its original hash. A wallet
+that reports the payment is processing is checked every two seconds; failed
+lookups back off to at most 30 seconds. Expired outgoing records are uncertain
+outcomes, not proof of failure, and also use the error backoff. No confirmation
+check resubmits the invoice. Old incoming
+invoice monitoring has a global budget of four requests per two seconds; each
+abandoned unpaid invoice waits 30 seconds between checks, or five minutes after
+expiry. Hashes remain monitored for late settlement. Failed entry-invoice requests
+also back off, and transport timeouts replace the NWC session for subsequent
+requests without replaying a send. Concurrent requests retain their original
+session until they finish.
 
 Each payout advances through recipient invoice preparation, durable InFlight,
 wallet submission, and confirmed receipt. Network jobs carry immutable IDs and
@@ -184,6 +215,15 @@ receiving verification are lobby commands; the in-game hot path never waits on
 them. The worker is concurrent in its I/O while fund mutations remain serialized.
 
 ## Validation
+
+For explicit recovery after replacing an NWC connection, the native host accepts
+`SATS_ARENA_RECOVER_WALLET_ID=<original 64-character ledger fingerprint>`. It
+opens that existing ledger in place and requires the replacement connection to
+prove a previously settled outgoing payment before any recovery work starts.
+The original ledger identity is preserved so the original connection can still
+resume it. This is a recovery override, not automatic wallet migration; it is
+rejected in Sandbox and when the original ledger is missing. Activity notes
+remain available across restarts.
 
 Encrypted local mock-relay tests exercise NIP44 and NIP04 requests, capability
 checks, invoice creation/settlement, valid/invalid proofs, a lost payment response

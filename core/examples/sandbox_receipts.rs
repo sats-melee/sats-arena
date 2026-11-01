@@ -92,8 +92,10 @@ async fn main() -> anyhow::Result<()> {
         incoming.push(json!({"player_port": player + 1, "sats": entry + fee}));
     }
     let mut receivers = BTreeMap::new();
+    let mut receiver_probes = BTreeMap::new();
     let mut confirmed = Vec::new();
     let mut unpaid_originals = Vec::new();
+    let mut discarded = Vec::new();
     let mut outstanding = Vec::new();
     let payouts = pot["payouts"].as_array().context("Missing payouts")?;
     let probe = NostrWalletConnect::builder(
@@ -104,10 +106,12 @@ async fn main() -> anyhow::Result<()> {
     .build();
     // shortcut: inspect only the latest 200 outgoing records for diagnostics;
     // paginate if older failures need investigation. Absence proves no outcome.
-    let history = if payouts
-        .iter()
-        .any(|p| !matches!(p["state"].as_str(), Some("Paid" | "Superseded")))
-    {
+    let history = if payouts.iter().any(|p| {
+        !matches!(
+            p["state"].as_str(),
+            Some("Paid" | "Superseded" | "Discarded")
+        )
+    }) {
         probe
             .list_transactions(ListTransactionsRequest {
                 transaction_type: Some(TransactionType::Outgoing),
@@ -120,17 +124,22 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let groups = saved["payout_groups"].as_object();
+    let mut transfers = BTreeMap::new();
     for payout in payouts {
         let id = payout["id"].as_str().context("Missing payout ID")?;
         let state = payout["state"].as_str().context("Missing payout state")?;
         let player = payout["player"].as_u64().context("Missing payout player")? as usize;
         ensure!(player < 4, "Invalid payout player");
         let prepared = &saved["prepared"][id];
-        if prepared.is_null() && !matches!(state, "Paid" | "Superseded") {
+        if state == "Discarded" {
+            discarded.push(id);
+        }
+        if prepared.is_null() && !matches!(state, "Paid" | "Superseded" | "Discarded") {
             outstanding.push(json!({"id": id, "local_state": state, "prepared": false}));
             continue;
         }
-        if state == "Superseded" && prepared.is_null() {
+        if matches!(state, "Superseded" | "Discarded") && prepared.is_null() {
             continue;
         }
         let hash = prepared["payment_hash"]
@@ -142,8 +151,17 @@ async fn main() -> anyhow::Result<()> {
         );
         if let std::collections::btree_map::Entry::Vacant(entry) = receivers.entry(player) {
             entry.insert(NwcWallet::connect(uri(player + 1)?).await?);
+            receiver_probes.insert(
+                player,
+                NostrWalletConnect::builder(
+                    NostrWalletConnectUri::parse(uri(player + 1)?)
+                        .map_err(|_| anyhow::anyhow!("Invalid Sandbox connection"))?,
+                )
+                .timeout(std::time::Duration::from_secs(12))
+                .build(),
+            );
         }
-        if !matches!(state, "Paid" | "Superseded") {
+        if !matches!(state, "Paid" | "Superseded" | "Discarded") {
             let lookup = match probe
                 .lookup_invoice(LookupInvoiceRequest {
                     payment_hash: Some(hash.into()),
@@ -188,17 +206,57 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         let received = receivers[&player].invoice_state(hash).await?;
-        if state == "Superseded" {
+        if matches!(state, "Superseded" | "Discarded") {
             ensure!(
                 !matches!(received, InvoiceState::Paid { .. }),
-                "A consolidated original invoice was paid"
+                "An unsent consolidated or discarded invoice was paid"
             );
-            unpaid_originals.push(id);
+            if state == "Superseded" {
+                unpaid_originals.push(id);
+            }
             continue;
         }
         let sats = payout["sats"].as_u64().context("Missing payout amount")?;
+        let group = groups.and_then(|groups| {
+            groups.iter().find(|(_, members)| {
+                members
+                    .as_array()
+                    .is_some_and(|members| members.iter().any(|m| m.as_str() == Some(id)))
+            })
+        });
+        let (transfer_id, transfer_sats) = if let Some((leader, members)) = group {
+            let members = members.as_array().context("Invalid combined transfer")?;
+            ensure!(
+                members.iter().any(|m| m.as_str() == Some(leader.as_str())),
+                "Missing transfer leader"
+            );
+            let mut total = 0u64;
+            for member in members {
+                let member = member.as_str().context("Invalid transfer allocation")?;
+                let part = payouts
+                    .iter()
+                    .find(|p| p["id"] == member)
+                    .context("Missing transfer allocation")?;
+                ensure!(
+                    part["state"] == "Paid"
+                        && saved["prepared"][member]["payment_hash"] == hash
+                        && saved["prepared"][member]["invoice"] == prepared["invoice"]
+                        && saved["prepared"][member]["address"] == prepared["address"],
+                    "Inconsistent transfer allocation"
+                );
+                total = total
+                    .checked_add(part["sats"].as_u64().context("Invalid allocation amount")?)
+                    .context("Transfer overflow")?;
+            }
+            (leader.as_str(), total)
+        } else {
+            (id, sats)
+        };
         ensure!(
-            received == (InvoiceState::Paid { amount_sats: sats }),
+            received
+                == (InvoiceState::Paid {
+                    amount_sats: transfer_sats
+                }),
             "Receiver has not confirmed the exact payout amount"
         );
         ensure!(
@@ -208,9 +266,29 @@ async fn main() -> anyhow::Result<()> {
             ),
             "Host has not confirmed the outgoing payout"
         );
-        confirmed.push(json!({"id": id, "player_port": player + 1, "sats": sats}));
+        let context = receiver_probes[&player]
+            .lookup_invoice(LookupInvoiceRequest {
+                payment_hash: Some(hash.into()),
+                invoice: None,
+            })
+            .await?;
+        let physical = json!({"transfer_id": transfer_id, "payment_hash": hash, "sats": transfer_sats,
+            "address": prepared["address"]});
+        if let Some(previous) = transfers.insert(hash.to_owned(), physical.clone()) {
+            ensure!(
+                previous == physical,
+                "A payment hash was reused outside its transfer"
+            );
+        }
+        confirmed.push(json!({"id": id, "player_port": player + 1, "sats": sats,
+            "transfer_id": transfer_id, "transfer_sats": transfer_sats, "payment_hash": hash,
+            "memo": prepared["memo"], "wallet_description": context.description,
+            "wallet_comment": context.metadata.as_ref().and_then(|m| m.get("comment")).and_then(Value::as_str)}));
     }
     for receiver in receivers.values() {
+        receiver.shutdown().await;
+    }
+    for receiver in receiver_probes.values() {
         receiver.shutdown().await;
     }
     host.shutdown().await;
@@ -220,9 +298,11 @@ async fn main() -> anyhow::Result<()> {
         serde_json::to_string_pretty(&json!({
             "match_id": pot["id"], "incoming_entries": incoming,
             "receiver_confirmed_payouts": confirmed,
+            "physical_transfers": transfers.into_values().collect::<Vec<_>>(),
             "unpaid_consolidated_originals": unpaid_originals,
+            "discarded_payouts": discarded,
             "outstanding": outstanding,
-            "all_payouts_confirmed": outstanding.is_empty(),
+            "all_payouts_confirmed": outstanding.is_empty() && discarded.is_empty(),
             "simulated": false,
         }))?
     );

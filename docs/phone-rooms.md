@@ -1,0 +1,115 @@
+# Phone rooms
+
+The phone server is a WebSocket relay and a React SPA in `server/frontend`.
+The native desktop remains the only invoice/payment authority. The room server
+has no wallet connection, ledger, funding rules, payment execution, or controller
+input stream. It relays player addresses and requests for the desktop's current
+entry invoice, and displays the desktop's damage totals and payment activity.
+
+## Run the server
+
+Use Node 22.12+ to build the SPA. Node/npm are build tools, not server runtime
+dependencies:
+
+```sh
+cd server/frontend
+npm ci
+npm run build
+cd ../..
+cargo run --release -p sats-arena-server -- rooms --bind 127.0.0.1:8738
+```
+
+`rooms` starts only the phone service; it does not load the older balance server's
+TOML config or open a wallet. `/health` identifies the room service.
+The default asset folder is `server/frontend/dist` in the build checkout. To
+distribute the binary, copy that folder too and pass its location:
+
+```sh
+./sats-arena-server rooms --bind 127.0.0.1:8738 --frontend /opt/sats-melee/frontend/dist
+```
+
+Put the service behind your HTTPS reverse proxy. Forward WebSocket upgrades and
+preserve the Host header. Browsers use the same origin for the SPA and socket;
+cross-origin socket handshakes are rejected. The desktop accepts plain HTTP only
+for localhost development. A server intended for internet hosting should have
+request/connection rate limits at the proxy. This first version bounds room count,
+message sizes, pending requests, and per-phone command frequency.
+
+For frontend development, run `npm run dev` in `server/frontend`; Vite proxies
+`/rooms` and `/health` to the Rust server on port 8738.
+
+### Local Wi-Fi preview
+
+To use a phone on the same Wi-Fi, bind the room service to the LAN interface:
+
+```sh
+./target/debug/sats-arena-server rooms --bind 0.0.0.0:8738 --frontend server/frontend/dist
+```
+
+Use `http://127.0.0.1:8738` in the desktop's **Phone room** setting. On the phone,
+open `http://<this-computer-LAN-IP>:8738` and enter the displayed room code.
+The desktop still connects over loopback; a separately hosted desktop connection
+still requires HTTPS. On local HTTP, **Copy invoice** selects and reveals the
+invoice when the browser does not provide clipboard access. Use the browser's
+Copy command or **Open Lightning wallet**. HTTPS supports direct clipboard copying.
+
+## Connect the desktop
+
+Rebuild the launcher and native Dolphin with the updated local Rust library.
+In launcher settings, enable **Phone room**, save the room server's HTTPS origin,
+and open LOCAL. Changes apply on the next LOCAL launch.
+The native sidebar displays a six-character room code and the website address.
+There is no room QR code. Direct native development can set
+`SATS_ARENA_ROOM_SERVER_URL=http://127.0.0.1:8738`; the launcher explicitly controls
+this variable through its toggle.
+
+On the phone:
+
+1. Open the server website, enter the code, and select your P1–P4 controller slot.
+   That slot must already be a selected human in Melee.
+2. Save your receiving Lightning Address. The desktop performs its existing
+   validation, including the fixed-address restriction in Sandbox.
+3. Choose **Get entry invoice**. The desktop returns its existing current entry
+   invoice when all participating receiving addresses are verified. Repeated
+   requests do not replace invoices. Open your wallet or copy the invoice to pay.
+4. The desktop's usual incoming lookup confirms payment. The website cannot
+   simulate funding or start a match. View damage and payment activity while
+   continuing to play with the controller.
+
+Existing rules still govern entry amounts, surcharge, admission, receiver locks,
+invoice expiry, payout batching and settlement. Phone requests include the
+current match ID, so a delayed request cannot affect a later game. Only the
+claimed player's invoice is sent to that phone. Address errors come from the
+desktop, and the room server never asserts that an invoice was paid.
+
+## Room lifetime
+
+Each native session creates its own random room code and a private desktop
+resume token. Slot claims are atomic and carry separate private resume tokens.
+Refreshing the phone restores its claim from browser storage; closing the page
+does not give its slot to someone else. **Leave room** releases it while the
+desktop reports addresses unlocked. Join all phones before paying entry.
+The same room and claims survive consecutive matches and brief disconnections.
+
+Rooms are in memory. Disconnected desktop rooms can be resumed for ten minutes;
+expired rooms are removed when another desktop connects. A server restart causes
+the desktop to create a new code. This does not affect the desktop ledger or
+ongoing gameplay/payment recovery. Phone status goes offline while the desktop
+reconnects, and displayed invoices are disabled until it returns.
+
+The SPA currently shows the current match's pairwise damage and the desktop's
+last 100 payment activity entries. It does not add durable account history or
+change the existing archived desktop payment records.
+
+## Checks
+
+```sh
+cargo test -p sats-arena-server -p sats-arena-local
+cd server/frontend && npm run build
+```
+
+The room transport test exercises HTTP Upgrade and WebSocket frames over duplex
+streams, so it also runs where OS listening sockets are unavailable. Payment
+rules and invoice reuse tests use the deterministic unit-test wallet. Actual
+invoice/payment acceptance still needs the controller-driven Alby Sandbox
+workflow in the launcher's `docs/sandbox.md`.

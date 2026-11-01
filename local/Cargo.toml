@@ -13,10 +13,14 @@ crate-type = ["cdylib", "rlib"]
 anyhow = "1"
 fs2 = "0.4"
 sats-arena-core = { workspace = true }
+sats-arena-protocol = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+url = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = "0.9"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 
 [dev-dependencies]
 async-trait = "0.1"

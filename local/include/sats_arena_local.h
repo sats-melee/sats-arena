@@ -28,14 +28,29 @@ typedef struct ArenaLocalView {
     char payment_error[256];
     uint32_t cpu_wallets;
     uint64_t background_pending_sats, background_failed_sats;
+    uint32_t summary_available, summary_complete, summary_teams;
+    int32_t summary_winner;
+    uint32_t summary_kinds[4], summary_team_ids[4];
+    uint64_t summary_damage_centi[4][4];
+    char summary_match_id[64];
+    uint64_t unsent_sats;
+    uint64_t missed_sats, payable_missed_sats;
+    char missed_log[4096];
 } ArenaLocalView;
-/* ABI 10. Background payouts are informational and never gate the current match.
+/* ABI 13. Unsent amount includes open batches and queued late-entry refunds.
+ * Last-match damage is frozen independently of later payout completion.
+ * Background payouts are informational and never gate the current match.
  * Fresh entry invoices for each financial participant, including opted-in CPUs.
  * Phase: 0 loading, 1 awaiting entry, 2 paid, 3 playing, 4 paid out,
  * 6 payouts pending, 7 error.
  * Actions: 1 next match, 2/3 pay sandbox entry (or simulate in unit-test fake mode) P1/P2, 4 start,
  * 5 cancel, 6/7 winner P1/P2, 8 no contest, 9/10 fund P3/P4,
- * 11/12 winner P3/P4 (winner identifies whole side in teams).
+ * 11/12 winner P3/P4 (winner identifies whole side in teams),
+ * 13 no contest with incomplete damage tracking,
+ * 14 discard unsent payouts (funds stay with host; submitted payments are untouched),
+ * 15 retry only proven failed payouts; unknown outcomes are checked, never resent.
+ * 16 pay safe missed amounts after their match ends, grouped by destination.
+ * Unconfirmed sends remain reserved; other live payouts continue.
  * credit(): cumulative finalized attributed damage received by P1/P2, centi-percent.
  * Duplicate counters are safe. New match resets counters to zero.
  * Fake/NWC incoming and outgoing wallets; live receiving-address verification.
@@ -44,6 +59,8 @@ ArenaLocalHandle* arena_local_create(const char* folder);
 /* Separate fake/live roots; live state is additionally bound to wallet identity. */
 ArenaLocalHandle* arena_local_create_configured(const char* fake_folder, const char* live_folder);
 bool arena_local_snapshot(const ArenaLocalHandle*, ArenaLocalView* out);
+/* Optional code-only phone room connection status, without wallet credentials. */
+bool arena_local_room_status(const ArenaLocalHandle*, char* out, uint32_t size);
 /* Read-only optional diagnostics; does not change funding, admission, or payments.
  * Disabled by default. Contains all local archived/current/recovering payouts,
  * open damage batches and received late-entry returns, including paid/failed items.

@@ -3,6 +3,7 @@
 
 mod address;
 mod fake;
+mod issue;
 mod lnurl;
 mod nwc;
 pub use address::{
@@ -13,6 +14,7 @@ pub use lnurl::{AddressVerification, AddressVerifier, LnurlClient, VERIFICATION_
 use async_trait::async_trait;
 
 pub use fake::{FakeAddressInvoices, FakeWallet};
+pub use issue::WalletIssue;
 pub use nwc::{IncomingReceiptError, NWC_WALLET_MANAGED_FEES, NwcWallet};
 
 pub struct NewInvoice {

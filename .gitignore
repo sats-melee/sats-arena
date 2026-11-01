@@ -1,4 +1,6 @@
 /target
+/server/frontend/node_modules
+/server/frontend/dist
 sats-arena.toml
 *.db
 *.db-shm

@@ -44,10 +44,21 @@ pub struct MatchPot {
     /// Cumulative received nominal damage; retained for diagnostic/legacy hosts.
     #[serde(default)]
     pub damage_centi: [u64; PLAYERS],
+    /// Finalized damage by attacker (row) and victim (column), across all stocks.
+    #[serde(default)]
+    pub damage_by_player_centi: [[u64; PLAYERS]; PLAYERS],
+    /// Older saved matches lack pairwise totals and must not appear complete.
+    #[serde(default)]
+    pub damage_tracking_complete: bool,
     pub payouts: Vec<Payout>,
     pub outcome: Option<Outcome>,
     #[serde(default)]
     pub unbatched: [u64; PLAYERS],
+    /// Sats taken from each victim in the recipient's currently collecting batch.
+    #[serde(default)]
+    pub unbatched_damage_sources: [[u64; PLAYERS]; PLAYERS],
+    #[serde(default)]
+    pub payout_damage_sources: BTreeMap<String, [u64; PLAYERS]>,
     #[serde(default)]
     pub batch_deadline_ms: [Option<u64>; PLAYERS],
     #[serde(default = "default_kinds")]
@@ -100,9 +111,13 @@ impl MatchPot {
             remaining: [0; PLAYERS],
             earned: [0; PLAYERS],
             damage_centi: [0; PLAYERS],
+            damage_by_player_centi: [[0; PLAYERS]; PLAYERS],
+            damage_tracking_complete: true,
             payouts: vec![],
             outcome: None,
             unbatched: [0; PLAYERS],
+            unbatched_damage_sources: [[0; PLAYERS]; PLAYERS],
+            payout_damage_sources: BTreeMap::new(),
             batch_deadline_ms: [None; PLAYERS],
             kinds: default_kinds(),
             team_ids: default_teams(),
@@ -259,6 +274,9 @@ impl MatchPot {
                 "all participating player entry invoices must be paid".into(),
             ));
         }
+        if self.last_credit_sequence == 0 && self.damage_centi == [0; PLAYERS] {
+            self.damage_tracking_complete = true;
+        }
         self.phase = Phase::Playing;
         Ok(())
     }
@@ -301,6 +319,8 @@ impl MatchPot {
             let victim = credit.victim;
             self.damage_centi[victim] =
                 self.damage_centi[victim].saturating_add(credit.damage_centi);
+            self.damage_by_player_centi[attacker][victim] =
+                self.damage_by_player_centi[attacker][victim].saturating_add(credit.damage_centi);
             if attacker == victim
                 || !self.participates(attacker)
                 || !self.participates(victim)
@@ -315,6 +335,7 @@ impl MatchPot {
             self.remaining[victim] -= sats;
             if sats > 0 {
                 self.unbatched[attacker] += sats;
+                self.unbatched_damage_sources[attacker][victim] += sats;
                 self.batch_deadline_ms[attacker]
                     .get_or_insert(now_ms.saturating_add(self.batch_window_ms));
             }
@@ -352,16 +373,21 @@ impl MatchPot {
         for player in 0..PLAYERS {
             if self.batch_deadline_ms[player].is_some_and(|deadline| now_ms >= deadline) {
                 let sats = std::mem::take(&mut self.unbatched[player]);
+                let sources = std::mem::take(&mut self.unbatched_damage_sources[player]);
                 self.batch_deadline_ms[player] = None;
-                self.payout(player, sats, Reason::Damage);
+                self.payout(player, sats, Reason::Damage, sources);
             }
         }
     }
 
-    fn payout(&mut self, player: usize, sats: u64, reason: Reason) {
+    fn payout(&mut self, player: usize, sats: u64, reason: Reason, sources: [u64; PLAYERS]) {
         if sats > 0 {
+            let id = format!("{}-{}", self.id, self.payouts.len());
+            if sources.iter().any(|&sats| sats > 0) {
+                self.payout_damage_sources.insert(id.clone(), sources);
+            }
             self.payouts.push(Payout {
-                id: format!("{}-{}", self.id, self.payouts.len()),
+                id,
                 player,
                 sats,
                 reason,
@@ -408,6 +434,7 @@ impl MatchPot {
         self.outcome = Some(outcome);
         let remaining = std::mem::take(&mut self.remaining);
         let mut final_sats = std::mem::take(&mut self.unbatched);
+        let final_sources = std::mem::take(&mut self.unbatched_damage_sources);
         self.batch_deadline_ms = [None; PLAYERS];
         let winners: Vec<usize> = (0..PLAYERS)
             .filter(|&i| self.participates(i) && winner.is_some_and(|w| self.same_side(i, w)))
@@ -433,7 +460,7 @@ impl MatchPot {
             }
         }
         for (player, sats) in final_sats.into_iter().enumerate() {
-            self.payout(player, sats, Reason::Settlement);
+            self.payout(player, sats, Reason::Settlement, final_sources[player]);
         }
         self.phase = Phase::Settling;
         self.update_phase();
@@ -443,25 +470,42 @@ impl MatchPot {
     /// Hosts call this only before dispatch. InFlight/Failed/Paid intents retain
     /// their amount and identity. Superseded records remain available for audit.
     pub fn consolidate_created(&mut self) -> bool {
+        self.consolidate_created_except(&std::collections::BTreeSet::new())
+    }
+
+    pub fn consolidate_created_except(
+        &mut self,
+        held: &std::collections::BTreeSet<String>,
+    ) -> bool {
         let mut changed = false;
         for player in 0..PLAYERS {
             let indices: Vec<_> = self
                 .payouts
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.player == player && p.state == PayoutState::Created)
+                .filter(|(_, p)| {
+                    p.player == player && p.state == PayoutState::Created && !held.contains(&p.id)
+                })
                 .map(|(i, _)| i)
                 .collect();
             if indices.len() < 2 {
                 continue;
             }
             let sats = indices.iter().map(|&i| self.payouts[i].sats).sum();
+            let mut sources = [0u64; PLAYERS];
+            for &i in &indices {
+                if let Some(part) = self.payout_damage_sources.get(&self.payouts[i].id) {
+                    for victim in 0..PLAYERS {
+                        sources[victim] = sources[victim].saturating_add(part[victim]);
+                    }
+                }
+            }
             let reason = if self.phase == Phase::Settling {
                 Reason::Settlement
             } else {
                 Reason::Damage
             };
-            self.payout(player, sats, reason);
+            self.payout(player, sats, reason, sources);
             let replacement = self.payouts.last().unwrap().id.clone();
             for i in indices {
                 self.payouts[i].state = PayoutState::Superseded;
@@ -480,6 +524,28 @@ impl MatchPot {
         }
         payout.state = PayoutState::InFlight;
         Ok(())
+    }
+
+    /// Discard only money that has never been submitted to a wallet.
+    pub fn discard_unsent(&mut self) -> u64 {
+        self.flush_due(u64::MAX);
+        let mut sats = 0;
+        for payout in &mut self.payouts {
+            if payout.state == PayoutState::Created {
+                payout.state = PayoutState::Discarded;
+                sats += payout.sats;
+            }
+        }
+        self.update_phase();
+        sats
+    }
+
+    pub fn discarded_sats(&self) -> u64 {
+        self.payouts
+            .iter()
+            .filter(|p| p.state == PayoutState::Discarded)
+            .map(|p| p.sats)
+            .sum()
     }
 
     pub fn confirm_payout(&mut self, index: usize) -> Result<()> {
@@ -517,6 +583,102 @@ impl MatchPot {
 mod tests {
     use super::*;
 
+    #[test]
+    fn damage_matrix_counts_all_credits_independently_of_payable_funds() {
+        let mut p = teams();
+        fund(&mut p);
+        credit(&mut p, 0, 2, 1234, 0); // Teammate damage is recorded, never paid.
+        assert_eq!(p.damage_by_player_centi[0][2], 1234);
+        assert_eq!(p.unbatched, [0; 4]);
+        credit(&mut p, 0, 1, 100_000, 0); // More damage than the victim's pot covers.
+        credit(&mut p, 0, 1, 5000, 0);
+        assert_eq!(p.damage_by_player_centi[0][1], 105_000);
+        assert_eq!(p.unbatched_damage_sources[0], [0, 500, 0, 0]);
+        let before = serde_json::to_value(&p).unwrap();
+        p.credit_batch_at(
+            &[Credit {
+                sequence: 3,
+                attacker: 0,
+                victim: 1,
+                damage_centi: 5000,
+            }],
+            1,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&p).unwrap(), before);
+        assert!(
+            p.credit_batch_at(
+                &[Credit {
+                    sequence: 5,
+                    attacker: 1,
+                    victim: 0,
+                    damage_centi: 1
+                }],
+                1
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&p).unwrap(), before);
+
+        let mut cpu = pot(false, [HUMAN, CPU, CLOSED, CLOSED], [NO_TEAM; 4]);
+        fund(&mut cpu);
+        credit(&mut cpu, 1, 0, 2000, 0);
+        assert_eq!(cpu.damage_by_player_centi[1][0], 2000);
+        assert_eq!(cpu.unbatched, [0; 4]);
+    }
+
+    #[test]
+    fn batch_sources_freeze_and_consolidate_without_changing_submitted_attribution() {
+        let mut p = ffa();
+        fund(&mut p);
+        credit(&mut p, 0, 1, 1000, 0);
+        credit(&mut p, 0, 2, 2000, 0);
+        p.flush_due(5000);
+        let first = p.payouts[0].id.clone();
+        assert_eq!(p.payout_damage_sources[&first], [0, 100, 200, 0]);
+        credit(&mut p, 0, 3, 500, 6000);
+        p.flush_due(11000);
+        assert_eq!(p.payout_damage_sources[&first], [0, 100, 200, 0]);
+        assert!(p.consolidate_created());
+        let combined = p.payouts.last().unwrap().id.clone();
+        assert_eq!(p.payout_damage_sources[&combined], [0, 100, 200, 50]);
+        p.begin_payout(p.payouts.len() - 1).unwrap();
+        credit(&mut p, 0, 2, 1, 12000); // Fraction stays with P2 until it earns a sat.
+        credit(&mut p, 0, 3, 1000, 12000);
+        p.finish(Some(0)).unwrap();
+        p.consolidate_created();
+        assert_eq!(p.payout_damage_sources[&combined], [0, 100, 200, 50]);
+        assert_eq!(
+            p.payout_damage_sources[&p.payouts.last().unwrap().id],
+            [0, 0, 0, 100]
+        );
+        let decoded: MatchPot = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(decoded.payout_damage_sources, p.payout_damage_sources);
+        assert_eq!(decoded.damage_by_player_centi, p.damage_by_player_centi);
+        conserved(&p);
+    }
+
+    #[test]
+    fn legacy_matches_do_not_claim_complete_pairwise_damage() {
+        let mut p = ffa();
+        fund(&mut p);
+        credit(&mut p, 0, 1, 1000, 0);
+        let mut old = serde_json::to_value(&p).unwrap();
+        for key in [
+            "damage_by_player_centi",
+            "damage_tracking_complete",
+            "unbatched_damage_sources",
+            "payout_damage_sources",
+        ] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let loaded: MatchPot = serde_json::from_value(old).unwrap();
+        assert!(!loaded.damage_tracking_complete);
+        assert_eq!(loaded.damage_by_player_centi, [[0; 4]; 4]);
+        assert_eq!(loaded.damage_centi[1], 1000);
+        assert_eq!(loaded.unbatched[0], 100);
+    }
+
     fn pot(teams: bool, kinds: [u8; 4], team_ids: [u8; 4]) -> MatchPot {
         let mut pot = MatchPot::new("arena".into(), 500, 10).unwrap();
         pot.configure(teams, kinds, team_ids).unwrap();
@@ -543,7 +705,8 @@ mod tests {
         assert_eq!(
             pot.remaining.iter().sum::<u64>()
                 + pot.earned.iter().sum::<u64>()
-                + pot.pending().iter().sum::<u64>(),
+                + pot.pending().iter().sum::<u64>()
+                + pot.discarded_sats(),
             pot.paid.iter().filter(|&&paid| paid).count() as u64 * pot.entry_sats
         );
         assert!(
@@ -590,6 +753,47 @@ mod tests {
                 conserved(pot);
             }
         }
+    }
+
+    #[test]
+    fn discard_only_removes_unsent_money_and_keeps_it_in_host_accounting() {
+        let mut p = ffa();
+        p.sats_per_percent = 1;
+        fund(&mut p);
+        for player in 0..4 {
+            credit(&mut p, player, (player + 1) % 4, 1000, 0);
+        }
+        p.flush_due(5000);
+        p.begin_payout(0).unwrap();
+        p.begin_payout(1).unwrap();
+        p.confirm_payout(1).unwrap();
+        p.begin_payout(2).unwrap();
+        p.payouts[2].state = PayoutState::Failed;
+        let submitted = p.payouts[..3].to_vec();
+        credit(&mut p, 3, 0, 500, 6000);
+        let remaining = p.remaining;
+        let earned = p.earned;
+        assert_eq!(p.discard_unsent(), 15);
+        assert_eq!(p.payouts[..3], submitted);
+        assert_eq!(p.remaining, remaining);
+        assert_eq!(p.earned, earned);
+        assert_eq!(p.unbatched, [0; 4]);
+        assert_eq!(p.pending(), [10, 0, 10, 0]);
+        assert_eq!(p.discarded_sats(), 15);
+        assert_eq!(p.discard_unsent(), 0);
+        conserved(&p);
+    }
+
+    #[test]
+    fn discarding_a_final_queue_resolves_it_without_claiming_any_payment() {
+        let mut p = ffa();
+        fund(&mut p);
+        p.finish(None).unwrap();
+        assert_eq!(p.discard_unsent(), p.entry_sats * 4);
+        assert_eq!(p.phase, Phase::Settled);
+        assert_eq!(p.earned, [0; 4]);
+        assert_eq!(p.pending(), [0; 4]);
+        conserved(&p);
     }
 
     #[test]

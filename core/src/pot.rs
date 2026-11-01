@@ -21,11 +21,13 @@ pub enum PayoutState {
     Failed,
     /// Never submitted; its funds are included in another payout instead.
     Superseded,
+    /// Never submitted; explicitly discarded by the host, which retains the funds.
+    Discarded,
 }
 
 impl PayoutState {
     pub fn complete(self) -> bool {
-        matches!(self, Self::Paid | Self::Superseded)
+        matches!(self, Self::Paid | Self::Superseded | Self::Discarded)
     }
 }
 

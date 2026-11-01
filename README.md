@@ -1,5 +1,9 @@
 # Sats Arena payment engine
 
+Optional code-only [phone rooms](docs/phone-rooms.md) have a React app in
+`server/frontend` and a WebSocket relay (`sats-arena-server rooms`). They connect
+to the existing native LOCAL payment engine without moving wallet rules to the server.
+
 The local game supports **2–4 participants in free-for-all or team battles**.
 Every human verifies a Lightning Address and pays a fresh entry each match;
 CPUs neither fund nor receive payments. See [the payment rules](docs/match-payments.md).

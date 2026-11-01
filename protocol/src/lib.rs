@@ -1,7 +1,9 @@
 //! Wire types shared by the Sats Arena server and the Dolphin client.
 //!
-//! Everything here is plain data. The server owns all money logic; clients
-//! only describe what happened in a match.
+//! Everything here is plain data. The legacy balance protocol is server-authoritative.
+//! Phone rooms only relay the native desktop's payment state and requests.
+
+pub mod rooms;
 
 use serde::{Deserialize, Serialize};
 

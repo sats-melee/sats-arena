@@ -1,8 +1,11 @@
 //! Wallet-neutral local host for up to four funded humans and CPU participants.
 //! Simulated wallet, live receiving verification, ordered damage and team settlement.
 mod config;
+mod missed;
 mod outbound_debug;
 mod payment_io;
+mod recovery;
+mod room_client;
 mod wallet_check;
 
 #[cfg(test)]
@@ -71,11 +74,23 @@ pub struct LocalView {
     pub cpu_wallets: u32,
     pub background_pending_sats: u64,
     pub background_failed_sats: u64,
+    pub summary_available: u32,
+    pub summary_complete: u32,
+    pub summary_teams: u32,
+    pub summary_winner: i32,
+    pub summary_kinds: [u32; 4],
+    pub summary_team_ids: [u32; 4],
+    pub summary_damage_centi: [[u64; 4]; 4],
+    pub summary_match_id: [u8; 64],
+    pub unsent_sats: u64,
+    pub missed_sats: u64,
+    pub payable_missed_sats: u64,
+    pub missed_log: [u8; 4096],
 }
 impl Default for LocalView {
     fn default() -> Self {
         Self {
-            abi_version: 10,
+            abi_version: 13,
             phase: 0,
             busy: 1,
             simulated: 1,
@@ -112,6 +127,18 @@ impl Default for LocalView {
             cpu_wallets: 0,
             background_pending_sats: 0,
             background_failed_sats: 0,
+            summary_available: 0,
+            summary_complete: 0,
+            summary_teams: 0,
+            summary_winner: -1,
+            summary_kinds: [3; 4],
+            summary_team_ids: [255; 4],
+            summary_damage_centi: [[0; 4]; 4],
+            summary_match_id: [0; 64],
+            unsent_sats: 0,
+            missed_sats: 0,
+            payable_missed_sats: 0,
+            missed_log: [0; 4096],
         }
     }
 }
@@ -133,6 +160,16 @@ struct Roster {
     characters: [u8; 4],
 }
 #[derive(Clone, Serialize, Deserialize)]
+struct MatchSummary {
+    match_id: String,
+    outcome: Outcome,
+    kinds: [u8; 4],
+    team_ids: [u8; 4],
+    teams: bool,
+    damage_centi: [[u64; 4]; 4],
+    complete: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     schema: u32,
     #[serde(default)]
@@ -149,6 +186,8 @@ struct Saved {
     roster: Option<Roster>,
     #[serde(default)]
     next_roster: Option<Roster>,
+    #[serde(default)]
+    last_match: Option<MatchSummary>,
     #[serde(default)]
     events: Vec<String>,
     #[serde(default)]
@@ -176,6 +215,10 @@ struct Saved {
     verification: [AddressCheck; 4],
     #[serde(default)]
     verified_addresses: BTreeMap<String, AddressVerification>,
+    #[serde(default)]
+    recovery: BTreeMap<String, recovery::Recovery>,
+    #[serde(default)]
+    payout_groups: BTreeMap<String, Vec<String>>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct RetiredEntry {
@@ -206,9 +249,19 @@ fn receipt_message(receipt: &Receipt, simulated: bool) -> String {
         if simulated { "SIMULATED " } else { "" },
         receipt.player + 1,
         receipt.sats,
-        detail.to_lowercase(),
+        detail,
         receipt.address
     )
+}
+
+fn damage_targets(sources: &[u64; 4]) -> String {
+    sources
+        .iter()
+        .enumerate()
+        .filter(|(_, sats)| **sats > 0)
+        .map(|(victim, _)| format!("P{}", victim + 1))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn payout_memo(pot: &MatchPot, payout: &Payout) -> String {
@@ -251,6 +304,19 @@ fn payout_memo(pot: &MatchPot, payout: &Payout) -> String {
             }
             None => "Match settlement".into(),
         },
+    };
+    let sources = pot.payout_damage_sources.get(&payout.id);
+    let targets = sources.map(damage_targets).unwrap_or_default();
+    let reason = if targets.is_empty() {
+        reason
+    } else if (payout.reason == Reason::Damage || reason == "Damage payout")
+        && sources.is_some_and(|s| {
+            s.iter().map(|&n| u128::from(n)).sum::<u128>() == u128::from(payout.sats)
+        })
+    {
+        format!("Damage to {targets}")
+    } else {
+        format!("{reason} • includes damage to {targets}")
     };
     format!("Sats Melee — {reason}")
 }
@@ -335,13 +401,14 @@ impl Demo {
             .cloned()
             .collect();
         Ok(Saved {
-            schema: 4,
+            schema: 5,
             wallet_identity: None,
             invoice_addresses: Default::default(),
             retired_entries: vec![],
             pending_matches: vec![],
             roster: None,
             next_roster: None,
+            last_match: None,
             events: vec![],
             activity: vec![],
             log_version: 1,
@@ -356,6 +423,8 @@ impl Demo {
             simulated,
             verification: Default::default(),
             verified_addresses: BTreeMap::new(),
+            recovery: BTreeMap::new(),
+            payout_groups: BTreeMap::new(),
             max_fee_sats: setting("SATS_ARENA_MAX_PAYOUT_FEE_SATS", default_fee_limit())?,
         })
     }
@@ -410,7 +479,23 @@ impl Demo {
             } else {
                 live_folder.to_path_buf()
             };
-            let folder = root.join(&identity);
+            let recovery = std::env::var("SATS_ARENA_RECOVER_WALLET_ID").ok();
+            if recovery.as_ref().is_some_and(|id| {
+                sandbox_players.is_some()
+                    || id.len() != 64
+                    || !id.bytes().all(|b| b.is_ascii_hexdigit())
+            }) {
+                return Err(Error::Rejected(
+                    "Invalid live recovery wallet identity".into(),
+                ));
+            }
+            let ledger_identity = recovery.as_ref().unwrap_or(&identity);
+            let folder = root.join(ledger_identity);
+            if recovery.is_some() && !folder.join("prepaid-match.json").is_file() {
+                return Err(Error::Rejected(
+                    "Original recovery ledger is missing".into(),
+                ));
+            }
             std::fs::create_dir_all(&folder).map_err(|e| Error::Internal(e.into()))?;
             let receiving = Arc::new(LnurlClient::default());
             #[cfg(test)]
@@ -419,15 +504,23 @@ impl Demo {
             let verifier: Arc<dyn AddressVerifier> = receiving.clone();
             let mut demo =
                 Self::open_with(&folder, Arc::new(wallet), receiving, None, verifier).await?;
+            // These NWC wallets stall under overlapping pay_invoice commands.
+            // Queue distinct sends here, before recording/dispatching InFlight.
+            demo.io.serialize_submissions = true;
+            demo.io.track_missed = true;
             if demo
                 .saved
                 .wallet_identity
                 .as_ref()
-                .is_some_and(|old| old != &identity)
+                .is_some_and(|old| old != ledger_identity)
             {
                 return Err(Error::Rejected(
                     "Stored match belongs to a different wallet connection".into(),
                 ));
+            }
+            if ledger_identity != &identity {
+                demo.verify_recovery_connection().await?;
+                demo.event("Replacement wallet connection verified against an original settled payment; recovering original ledger".into());
             }
             if demo.saved.wallet_identity.is_none()
                 && (demo.saved.pot.paid.iter().any(|p| *p) || !demo.saved.prepared.is_empty())
@@ -448,7 +541,7 @@ impl Demo {
                 }
             }
             demo.sandbox_players = sandbox_players;
-            demo.saved.wallet_identity = Some(identity);
+            demo.saved.wallet_identity = Some(ledger_identity.clone());
             demo.saved.max_fee_sats = NWC_WALLET_MANAGED_FEES;
             demo.save()?;
             Ok(demo)
@@ -537,7 +630,7 @@ impl Demo {
                 "payment state belongs to a different wallet mode".into(),
             ));
         }
-        if !(1..=4).contains(&saved.schema) {
+        if !(1..=5).contains(&saved.schema) {
             return Err(Error::Rejected("unsupported prepaid match state".into()));
         }
         if saved.schema == 1 && saved.pot.paid.iter().any(|paid| *paid) {
@@ -586,12 +679,15 @@ impl Demo {
         saved
             .used_payment_hashes
             .extend(saved.prepared.values().map(|p| p.payment_hash.clone()));
-        // Activity is a per-application-session display. Financial receipts,
-        // prepared invoices and payout states remain durable for recovery.
-        saved.activity.clear();
+        // Keep address-specific failure and receipt notes available after restart.
         saved.events.clear();
         saved.log_version = 1;
-        saved.schema = 4;
+        saved.schema = 5;
+        saved.validate_payout_groups()?;
+        for owner in &mut saved.pending_matches {
+            owner.validate_payout_groups()?;
+            owner.schema = 5;
+        }
         let mut demo = Self {
             wallet,
             provider,
@@ -812,6 +908,13 @@ impl Demo {
         )
         .await?;
         next.retired_entries = self.saved.retired_entries.clone();
+        next.recovery = self
+            .saved
+            .recovery
+            .iter()
+            .filter(|(id, _)| id.starts_with("late-entry-"))
+            .map(|(id, recovery)| (id.clone(), recovery.clone()))
+            .collect();
         next.pending_matches = self.saved.pending_matches.clone();
         if self.saved.pot.phase == Phase::Settling {
             let mut previous = self.saved.clone();
@@ -824,6 +927,7 @@ impl Demo {
             next.pending_matches.push(previous);
         }
         next.roster = roster;
+        next.last_match = self.saved.last_match.clone();
         next.addresses = self.saved.addresses.clone();
         next.verification = self.saved.verification.clone();
         next.verified_addresses = self.saved.verified_addresses.clone();
@@ -892,7 +996,7 @@ impl Demo {
                 .saved
                 .retired_entries
                 .iter()
-                .filter(|entry| entry.state != PayoutState::Paid)
+                .filter(|entry| !entry.state.complete())
                 .map(|entry| entry.received_sats.unwrap_or(0))
                 .sum::<u64>();
         let failed = self
@@ -1069,11 +1173,18 @@ impl Demo {
                     self.require_addresses()?;
                     self.saved.pot.start()?;
                 }
-                5 | 8 => {
+                5 | 8 | 13 => {
                     let previous = self.saved.pot.outcome;
+                    let played = self.saved.pot.phase == Phase::Playing;
                     self.saved.pot.finish(None)?;
+                    if action == 13 && played {
+                        self.saved.pot.damage_tracking_complete = false;
+                    }
+                    if played {
+                        self.remember_summary();
+                    }
                     if previous.is_none() {
-                        self.event("No contest • unspent entries returned".into());
+                        self.event("No contest • sending unspent entry refunds".into());
                     }
                 }
                 6 | 7 | 11 | 12 => {
@@ -1083,7 +1194,11 @@ impl Demo {
                         (action - 9) as usize
                     };
                     let previous = self.saved.pot.outcome;
+                    let played = self.saved.pot.phase == Phase::Playing;
                     self.saved.pot.finish(Some(player))?;
+                    if played {
+                        self.remember_summary();
+                    }
                     if previous.is_none() {
                         let name = if self.saved.pot.teams {
                             format!(
@@ -1096,6 +1211,9 @@ impl Demo {
                         self.event(format!("{name} wins • settlement"));
                     }
                 }
+                14 => self.discard_unsent()?,
+                15 => self.retry_failed()?,
+                16 => self.pay_missed()?,
                 _ => return Err(Error::Rejected("unknown prepaid match action".into())),
             },
         }
@@ -1129,6 +1247,18 @@ impl Demo {
             }
         }
         Ok(())
+    }
+    fn remember_summary(&mut self) {
+        let pot = &self.saved.pot;
+        self.saved.last_match = pot.outcome.map(|outcome| MatchSummary {
+            match_id: pot.id.clone(),
+            outcome,
+            kinds: pot.kinds,
+            team_ids: pot.team_ids,
+            teams: pot.teams,
+            damage_centi: pot.damage_by_player_centi,
+            complete: pot.damage_tracking_complete,
+        });
     }
     fn retire_entry(&mut self, player: usize, received_sats: Option<u64>) {
         let hash = std::mem::take(&mut self.saved.hashes[player]);
@@ -1186,6 +1316,7 @@ impl Demo {
             cpu_wallets: u32::from(pot.cpu_wallets),
             background_pending_sats,
             background_failed_sats,
+            unsent_sats: self.unsent_sats(),
             entry_sats: pot.entry_sats,
             batch_window_ms: pot.batch_window_ms,
             surcharge_bps: pot.surcharge_bps,
@@ -1212,6 +1343,23 @@ impl Demo {
             last_credit_sequence: pot.last_credit_sequence,
             ..LocalView::default()
         };
+        let (missed, payable, log) = self.missed_summary();
+        view.missed_sats = missed;
+        view.payable_missed_sats = payable;
+        text(&mut view.missed_log, &log);
+        if let Some(summary) = &self.saved.last_match {
+            view.summary_available = 1;
+            view.summary_complete = u32::from(summary.complete);
+            view.summary_teams = u32::from(summary.teams);
+            view.summary_winner = match summary.outcome {
+                Outcome::Winner(p) => p as i32,
+                Outcome::NoContest => -1,
+            };
+            view.summary_kinds = summary.kinds.map(u32::from);
+            view.summary_team_ids = summary.team_ids.map(u32::from);
+            view.summary_damage_centi = summary.damage_centi;
+            text(&mut view.summary_match_id, &summary.match_id);
+        }
         for i in 0..4 {
             text(&mut view.invoices[i], &self.saved.invoices[i]);
             text(&mut view.addresses[i], &self.saved.addresses[i]);
@@ -1345,6 +1493,7 @@ pub struct LocalHandle {
     sender: SyncSender<Command>,
     shared: Arc<Mutex<LocalView>>,
     outbound: Arc<outbound_debug::DebugView>,
+    room_status: Arc<Mutex<String>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -1379,6 +1528,8 @@ pub unsafe extern "C" fn arena_local_create_configured(
         let target = shared.clone();
         let outbound = Arc::new(outbound_debug::DebugView::default());
         let outbound_target = outbound.clone();
+        let room_status = Arc::new(Mutex::new(String::new()));
+        let room_status_target = room_status.clone();
         let (sender, receiver) = mpsc::sync_channel(16);
         let worker = std::thread::Builder::new()
             .name("arena-local-wallet".into())
@@ -1422,7 +1573,13 @@ pub unsafe extern "C" fn arena_local_create_configured(
                         return;
                     }
                 };
-                runtime.block_on(run_worker(demo, receiver, target, outbound_target));
+                runtime.block_on(run_worker(
+                    demo,
+                    receiver,
+                    target,
+                    outbound_target,
+                    room_status_target,
+                ));
             });
         let Ok(worker) = worker else {
             return std::ptr::null_mut();
@@ -1431,6 +1588,7 @@ pub unsafe extern "C" fn arena_local_create_configured(
             sender,
             shared,
             outbound,
+            room_status,
             worker: Some(worker),
         }))
     })
@@ -1445,9 +1603,24 @@ async fn run_worker(
     receiver: mpsc::Receiver<Command>,
     target: Arc<Mutex<LocalView>>,
     outbound: Arc<outbound_debug::DebugView>,
+    room_status: Arc<Mutex<String>>,
 ) {
     let mut message = String::new();
     let mut outbound_history = outbound_debug::History::default();
+    let mut room = std::env::var("SATS_ARENA_ROOM_SERVER_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .and_then(
+            |url| match room_client::Bridge::start(&url, room_status.clone()) {
+                Ok(bridge) => Some(bridge),
+                Err(error) => {
+                    *room_status.lock().unwrap() = error.into();
+                    None
+                }
+            },
+        );
+    let mut next_room_update = std::time::Instant::now();
+    let mut last_room_snapshot = String::new();
     loop {
         let processed_action = match receiver.try_recv() {
             Ok(action) => {
@@ -1478,10 +1651,43 @@ async fn run_worker(
             }
             view.revision = previous.revision + 1;
             text(&mut view.error, &message);
-            text(&mut view.payment_error, &payment_message);
+            text(
+                &mut view.payment_error,
+                demo.payment_notice().as_deref().unwrap_or(&payment_message),
+            );
             *previous = view;
         }
         outbound.refresh(&demo, &mut outbound_history);
+        if let Some(room) = &mut room {
+            // Game commands retain priority; phone requests use this same ledger coordinator.
+            let game_busy = target.lock().unwrap().busy != 0;
+            if !processed_action && !game_busy {
+                if let Ok(command) = room.commands.try_recv() {
+                    let request_id = command.request_id();
+                    let error = demo
+                        .room_command(command)
+                        .await
+                        .err()
+                        .map(|error| error.to_string());
+                    let _ = room
+                        .replies
+                        .try_send(sats_arena_protocol::rooms::HostMessage::Reply {
+                            request_id,
+                            error,
+                        });
+                }
+            }
+            if std::time::Instant::now() >= next_room_update {
+                let snapshot = demo.room_snapshot();
+                if let Ok(json) = serde_json::to_string(&snapshot) {
+                    if json != last_room_snapshot {
+                        last_room_snapshot = json;
+                        let _ = room.snapshots.send(Some(snapshot));
+                    }
+                }
+                next_room_update = std::time::Instant::now() + Duration::from_millis(250);
+            }
+        }
         // Keep the runtime polling NWC relay tasks between commands.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1515,7 +1721,7 @@ pub unsafe extern "C" fn arena_local_snapshot(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arena_local_action(handle: *const LocalHandle, action: u32) -> bool {
     ffi_guard(|| {
-        if handle.is_null() || !(1..=12).contains(&action) {
+        if handle.is_null() || !(1..=16).contains(&action) {
             return false;
         }
         let handle = unsafe { &*handle };
@@ -1546,6 +1752,7 @@ pub unsafe extern "C" fn arena_local_destroy(handle: *mut LocalHandle) {
             sender,
             shared: _,
             outbound: _,
+            room_status: _,
             mut worker,
         } = *unsafe { Box::from_raw(handle) };
         drop(sender);
@@ -1560,6 +1767,147 @@ pub unsafe extern "C" fn arena_local_destroy(handle: *mut LocalHandle) {
 // and the mutex-protected snapshot.
 fn ffi_guard<T>(action: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).ok()
+}
+
+/// # Safety
+/// Handle is live and `out` points to `size` writable bytes. Contains no wallet credentials.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arena_local_room_status(
+    handle: *const LocalHandle,
+    out: *mut c_char,
+    size: u32,
+) -> bool {
+    ffi_guard(|| {
+        if handle.is_null() || out.is_null() || size == 0 {
+            return false;
+        }
+        let handle = unsafe { &*handle };
+        let Ok(status) = handle.room_status.try_lock() else {
+            return false;
+        };
+        let mut length = status.len().min(size as usize - 1);
+        while !status.is_char_boundary(length) {
+            length -= 1;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(status.as_ptr(), out.cast(), length);
+            *out.add(length) = 0;
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+impl Demo {
+    async fn room_command(
+        &mut self,
+        command: sats_arena_protocol::rooms::DesktopCommand,
+    ) -> Result<()> {
+        use sats_arena_protocol::rooms::DesktopCommand;
+        let (player, match_id) = match &command {
+            DesktopCommand::SetAddress {
+                player, match_id, ..
+            }
+            | DesktopCommand::RequestInvoice {
+                player, match_id, ..
+            } => (*player, match_id),
+        };
+        if match_id != &self.saved.pot.id {
+            return Err(Error::Rejected(
+                "Match changed; wait for the room to update".into(),
+            ));
+        }
+        if player >= 4 || self.saved.roster.is_none() || self.saved.pot.kinds[player] != 0 {
+            return Err(Error::Rejected(
+                "Select this human player in Melee first".into(),
+            ));
+        }
+        if !matches!(self.saved.pot.phase, Phase::Funding | Phase::Ready) {
+            return Err(Error::Rejected(
+                "Wait for the next match before requesting an entry invoice".into(),
+            ));
+        }
+        match command {
+            DesktopCommand::SetAddress { address, .. } => {
+                self.command(Command::Address(player, address)).await
+            }
+            DesktopCommand::RequestInvoice { .. } => {
+                if self.saved.pot.paid[player] {
+                    return Err(Error::Rejected("This entry is already paid".into()));
+                }
+                let address = self.saved.addresses[player].clone();
+                if address.is_empty() {
+                    return Err(Error::Rejected("Save your Lightning Address first".into()));
+                }
+                // Invoice creation/expiry stays in the existing wallet worker; this is a read request.
+                Ok(())
+            }
+        }
+    }
+
+    fn room_snapshot(&self) -> sats_arena_protocol::rooms::Snapshot {
+        use sats_arena_protocol::rooms::{LogEntry, Player, Snapshot};
+        let view = self.view().unwrap_or_default();
+        let pot = &self.saved.pot;
+        let all_verified = (0..4)
+            .filter(|&i| pot.kinds[i] == 0 || (pot.cpu_wallets && pot.kinds[i] == 1))
+            .all(|i| view.verification_state[i] == 2);
+        let locked = match pot.phase {
+            Phase::Funding | Phase::Ready => pot.paid.iter().any(|paid| *paid),
+            Phase::Playing | Phase::Settling => true,
+            Phase::Settled => false,
+        };
+        Snapshot {
+            match_id: pot.id.clone(),
+            phase: view.phase as u8,
+            mode: if view.sandbox != 0 {
+                "sandbox"
+            } else if view.simulated != 0 {
+                "simulated"
+            } else {
+                "lightning"
+            }
+            .into(),
+            roster_ready: self.saved.roster.is_some(),
+            locked,
+            entry_sats: pot.entry_sats,
+            invoice_sats: pot.invoice_sats(),
+            players: std::array::from_fn(|i| Player {
+                kind: pot.kinds[i],
+                address: self.saved.addresses[i].clone(),
+                verification: view.verification_state[i] as u8,
+                message: String::from_utf8_lossy(
+                    view.verification_message[i]
+                        .split(|b| *b == 0)
+                        .next()
+                        .unwrap_or_default(),
+                )
+                .into_owned(),
+                invoice: if self.saved.roster.is_some()
+                    && all_verified
+                    && !pot.paid[i]
+                    && matches!(pot.phase, Phase::Funding | Phase::Ready)
+                {
+                    self.saved.invoices[i].clone()
+                } else {
+                    String::new()
+                },
+                paid_sats: view.paid_sats[i],
+                earned_sats: view.earned_sats[i],
+                pending_sats: view.pending_sats[i],
+            }),
+            damage_centi: pot.damage_by_player_centi,
+            logs: self
+                .saved
+                .activity
+                .iter()
+                .map(|entry| LogEntry {
+                    at_ms: entry.at_ms,
+                    message: entry.message.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// # Safety
@@ -1760,6 +2108,156 @@ pub unsafe extern "C" fn arena_local_addresses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payment_memo_names_only_the_opponents_in_that_frozen_batch() {
+        let mut pot = MatchPot::new("memo".into(), 500, 1).unwrap();
+        pot.configure(false, [0; 4], [255; 4]).unwrap();
+        for p in 0..4 {
+            pot.confirm_entry(p, 500).unwrap();
+        }
+        pot.start().unwrap();
+        pot.credit_batch_at(
+            &[
+                Credit {
+                    sequence: 1,
+                    attacker: 0,
+                    victim: 1,
+                    damage_centi: 1200,
+                },
+                Credit {
+                    sequence: 2,
+                    attacker: 0,
+                    victim: 2,
+                    damage_centi: 800,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+        pot.flush_due(5000);
+        let first = pot.payouts[0].clone();
+        assert_eq!(payout_memo(&pot, &first), "Sats Melee — Damage to P2, P3");
+        pot.credit_batch_at(
+            &[Credit {
+                sequence: 3,
+                attacker: 0,
+                victim: 3,
+                damage_centi: 700,
+            }],
+            6000,
+        )
+        .unwrap();
+        assert_eq!(payout_memo(&pot, &first), "Sats Melee — Damage to P2, P3");
+        pot.finish(Some(0)).unwrap();
+        pot.consolidate_created();
+        let final_payment = pot.payouts.last().unwrap();
+        assert_eq!(
+            payout_memo(&pot, final_payment),
+            "Sats Melee — Match won • includes damage to P2, P3, P4"
+        );
+        let receipt = Receipt {
+            id: first.id.clone(),
+            at_ms: 0,
+            player: 0,
+            address: "alice@example.test".into(),
+            sats: first.sats,
+            detail: "Damage".into(),
+            memo: payout_memo(&pot, &first),
+        };
+        assert!(receipt_message(&receipt, false).contains("Damage to P2, P3"));
+    }
+
+    #[test]
+    fn last_match_summary_survives_next_lobby_and_restart_without_changing() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut demo = Demo::open(dir.path()).await.unwrap();
+                demo.saved.addresses[0] = "alice@example.test".into();
+                demo.saved.addresses[1] = "bob@example.test".into();
+                for p in 0..2 {
+                    demo.saved.pot.confirm_entry(p, 500).unwrap();
+                }
+                demo.saved.pot.start().unwrap();
+                demo.command(Command::Credits(vec![
+                    Credit {
+                        sequence: 1,
+                        attacker: 0,
+                        victim: 1,
+                        damage_centi: 1234,
+                    },
+                    Credit {
+                        sequence: 2,
+                        attacker: 1,
+                        victim: 0,
+                        damage_centi: 567,
+                    },
+                ]))
+                .await
+                .unwrap();
+                demo.command(Command::Action(6)).await.unwrap();
+                let view = demo.view().unwrap();
+                assert_eq!(
+                    (
+                        view.summary_available,
+                        view.summary_complete,
+                        view.summary_winner
+                    ),
+                    (1, 1, 0)
+                );
+                assert_eq!(view.summary_damage_centi[0][1], 1234);
+                assert_eq!(view.summary_damage_centi[1][0], 567);
+                demo.command(Command::Action(1)).await.unwrap();
+                assert_eq!(demo.saved.pot.damage_by_player_centi, [[0; 4]; 4]);
+                assert_eq!(
+                    demo.view().unwrap().summary_damage_centi,
+                    view.summary_damage_centi
+                );
+                assert_eq!(demo.view().unwrap().summary_match_id, view.summary_match_id);
+                drop(demo);
+                let reopened = Demo::open(dir.path()).await.unwrap();
+                assert_eq!(
+                    reopened.view().unwrap().summary_damage_centi,
+                    view.summary_damage_centi
+                );
+                assert_eq!(
+                    reopened.view().unwrap().summary_match_id,
+                    view.summary_match_id
+                );
+            });
+    }
+
+    #[test]
+    fn incomplete_capture_is_not_presented_as_a_complete_match() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut demo = Demo::open(dir.path()).await.unwrap();
+                for p in 0..2 {
+                    demo.saved.pot.confirm_entry(p, 500).unwrap();
+                }
+                demo.saved.pot.start().unwrap();
+                demo.command(Command::Action(13)).await.unwrap();
+                let view = demo.view().unwrap();
+                assert_eq!(
+                    (
+                        view.summary_available,
+                        view.summary_complete,
+                        view.summary_winner
+                    ),
+                    (1, 0, -1)
+                );
+                demo.command(Command::Action(1)).await.unwrap();
+                assert_eq!(demo.view().unwrap().summary_complete, 0);
+            });
+    }
     #[test]
     fn changed_unfunded_settings_retire_old_invoice_amounts() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1995,12 +2493,14 @@ mod tests {
 
     #[test]
     fn two_fresh_invoices_live_outgoing_payout_then_winner_pot_and_new_invoices() {
-        assert_eq!(std::mem::size_of::<LocalView>(), 14784);
+        assert_eq!(std::mem::size_of::<LocalView>(), 19144);
         let dir = tempfile::tempdir().unwrap();
         let host = Handle::open(dir.path());
         let initial = host.wait(|v| v.busy == 0);
         assert!(initial.invoices[..2].iter().all(|v| v[0] != 0));
         assert_ne!(initial.invoices[0], initial.invoices[1]);
+        assert_eq!(initial.abi_version, 13);
+        assert_eq!(host.action(16).error[0], 0); // The native button must reach the worker.
         host.fund();
         let live = host.credit([0, 800]);
         assert_eq!(live.earned_sats, [0, 0, 0, 0]);

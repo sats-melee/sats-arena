@@ -1,7 +1,7 @@
 //! NIP-47 wallet adapter. Connection probes do not create or pay invoices.
 //! Standard NWC has no per-payment fee cap: fees must be controlled by the
 //! wallet connection's policy, explicitly selected with NWC_WALLET_MANAGED_FEES.
-use super::{DecodedInvoice, InvoiceState, NewInvoice, PaymentState, Wallet};
+use super::{DecodedInvoice, InvoiceState, NewInvoice, PaymentState, Wallet, WalletIssue};
 use ::nwc::NostrWalletConnect;
 use ::nwc::prelude::{
     Keys, ListTransactionsRequest, LookupInvoiceRequest, LookupInvoiceResponse, MakeInvoiceRequest,
@@ -13,6 +13,7 @@ use lightning_invoice::{Bolt11Invoice, Currency};
 use sha2::{Digest, Sha256};
 use std::{
     str::FromStr,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,7 +22,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Intentionally not Debug: the SDK client owns a secret connection URI.
 pub struct NwcWallet {
-    client: NostrWalletConnect,
+    client: RwLock<Arc<NostrWalletConnect>>,
     identity: String,
     timeout: Duration,
     can_list_transactions: bool,
@@ -125,7 +126,7 @@ impl NwcWallet {
             );
         }
         Ok(Self {
-            client,
+            client: RwLock::new(Arc::new(client)),
             identity,
             timeout,
             can_list_transactions: info.methods.contains(&Method::ListTransactions),
@@ -135,22 +136,49 @@ impl NwcWallet {
     pub fn identity(&self) -> String {
         self.identity.clone()
     }
+    fn client(&self) -> Arc<NostrWalletConnect> {
+        self.client.read().unwrap().clone()
+    }
+    fn request_result<T>(
+        &self,
+        client: &Arc<NostrWalletConnect>,
+        result: Result<Result<T, ::nwc::error::Error>, tokio::time::error::Elapsed>,
+    ) -> anyhow::Result<T> {
+        let issue = match result {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => WalletIssue::from_nwc(&error),
+            Err(_) => WalletIssue::Timeout,
+        };
+        if matches!(issue, WalletIssue::Timeout | WalletIssue::Unavailable) {
+            let mut current = self.client.write().unwrap();
+            if Arc::ptr_eq(&current, client) {
+                // Replace only the failed session. Existing requests retain their
+                // client until completion; a payment is never replayed here.
+                *current = Arc::new(
+                    NostrWalletConnect::builder(client.uri().clone())
+                        .timeout(self.timeout)
+                        .build(),
+                );
+            }
+        }
+        Err(issue.into())
+    }
     pub async fn shutdown(&self) {
-        self.client.shutdown().await;
+        self.client().shutdown().await;
     }
     async fn lookup(&self, payment_hash: &str) -> anyhow::Result<LookupInvoiceResponse> {
         let hash = normalized_hash(payment_hash)?;
+        let client = self.client();
         let response = tokio::time::timeout(self.timeout, async {
-            self.client
+            client
                 .lookup_invoice(LookupInvoiceRequest {
                     payment_hash: Some(hash.clone()),
                     invoice: None,
                 })
                 .await
         })
-        .await
-        .map_err(|_| anyhow!("NWC lookup timed out"))?
-        .map_err(|_| anyhow!("NWC lookup unavailable"))?;
+        .await;
+        let response = self.request_result(&client, response)?;
         checked_lookup(response, &hash)
     }
 
@@ -159,6 +187,7 @@ impl NwcWallet {
             return Err(IncomingReceiptError::HistoryPermission.into());
         }
         let hash = normalized_hash(payment_hash)?;
+        let client = self.client();
         // Alby can return the newer outgoing record for a payment to the same wallet.
         // Only a separate matching incoming receipt may authorize entry credit.
         for page in 0..4 {
@@ -170,11 +199,12 @@ impl NwcWallet {
                 ..Default::default()
             };
             let receipts = tokio::time::timeout(self.timeout, async {
-                self.client.list_transactions(request).await
+                client.list_transactions(request).await
             })
-            .await
-            .map_err(|_| IncomingReceiptError::HistoryUnavailable)?
-            .map_err(|_| IncomingReceiptError::HistoryUnavailable)?;
+            .await;
+            let receipts = self
+                .request_result(&client, receipts)
+                .map_err(|_| IncomingReceiptError::HistoryUnavailable)?;
             let count = receipts.len();
             for receipt in receipts {
                 if receipt.transaction_type == Some(TransactionType::Incoming)
@@ -270,8 +300,9 @@ impl Wallet for NwcWallet {
             .checked_mul(1000)
             .filter(|a| *a > 0)
             .ok_or_else(|| anyhow!("invalid invoice amount"))?;
+        let client = self.client();
         let response = tokio::time::timeout(self.timeout, async {
-            self.client
+            client
                 .make_invoice(MakeInvoiceRequest {
                     amount,
                     description: Some(memo.to_owned()),
@@ -280,9 +311,8 @@ impl Wallet for NwcWallet {
                 })
                 .await
         })
-        .await
-        .map_err(|_| anyhow!("NWC invoice creation timed out"))?
-        .map_err(|_| anyhow!("NWC invoice creation failed"))?;
+        .await;
+        let response = self.request_result(&client, response)?;
         let parsed = parse_invoice(&response.invoice)?;
         ensure!(
             parsed.amount_milli_satoshis() == Some(amount),
@@ -324,14 +354,13 @@ impl Wallet for NwcWallet {
                 amount_sats: response.amount / 1000,
             })
         } else if response.state == Some(TransactionState::Expired)
-            || (response.state.is_none()
-                && response.expires_at.is_some_and(|expiry| {
-                    expiry.as_secs()
-                        <= SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                }))
+            || response.expires_at.is_some_and(|expiry| {
+                expiry.as_secs()
+                    <= SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+            })
         {
             Ok(InvoiceState::Expired)
         } else {
@@ -354,21 +383,20 @@ impl Wallet for NwcWallet {
             Ok(invoice) => invoice,
             Err(_) => {
                 return Ok(PaymentState::Failed {
-                    reason: "Outgoing invoice is invalid or expired before submission".into(),
+                    reason: WalletIssue::InvalidInvoice.to_string(),
                 });
             }
         };
+        let client = self.client();
         let response = tokio::time::timeout(self.timeout, async {
-            self.client
-                .pay_invoice(PayInvoiceRequest::new(bolt11))
-                .await
+            client.pay_invoice(PayInvoiceRequest::new(bolt11)).await
         })
         .await;
-        match response {
-            Ok(Ok(paid)) => {
+        match self.request_result(&client, response) {
+            Ok(paid) => {
                 // A success acknowledgement must contain the invoice's real preimage.
                 if verify_preimage(&paid.preimage, &invoice.payment_hash).is_err() {
-                    return Ok(PaymentState::Pending);
+                    return Err(WalletIssue::InvalidProof.into());
                 }
                 // NIP-47 permits missing fee data; the embedded host does not debit
                 // fees from player pots. Zero means unreported when omitted.
@@ -376,27 +404,39 @@ impl Wallet for NwcWallet {
                     fee_sats: fee_sats(paid.fees_paid.unwrap_or(0)),
                 })
             }
-            // Lost or rejected responses do not authorize releasing funds. The
-            // durable host looks up the original payment hash and never resends.
-            _ => Ok(PaymentState::Pending),
+            Err(error) => {
+                let issue = error
+                    .downcast_ref::<WalletIssue>()
+                    .copied()
+                    .unwrap_or(WalletIssue::Unavailable);
+                if issue.rejected_before_payment() {
+                    Ok(PaymentState::Failed {
+                        reason: issue.to_string(),
+                    })
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
     async fn payment_state(&self, payment_hash: &str) -> anyhow::Result<PaymentState> {
         // An unavailable lookup is an unknown outcome, but is not evidence
         // that the provider actually reports an in-flight transaction.
         let response = self.lookup(payment_hash).await?;
-        ensure!(
-            response.transaction_type == Some(TransactionType::Outgoing),
-            "NWC lookup did not identify an outgoing payment"
-        );
+        if response.transaction_type != Some(TransactionType::Outgoing) {
+            return Err(WalletIssue::OutgoingReceiptMissing.into());
+        }
         if settled(&response) {
             Ok(PaymentState::Succeeded {
                 fee_sats: fee_sats(response.fees_paid),
             })
         } else if response.state == Some(TransactionState::Failed) {
             Ok(PaymentState::Failed {
-                reason: "NWC wallet confirmed the outgoing payment failed".into(),
+                reason: WalletIssue::Failed.to_string(),
             })
+        } else if response.state == Some(TransactionState::Expired) {
+            // Expiry is not proof an outgoing HTLC failed; retain funds and back off.
+            Err(WalletIssue::Expired.into())
         } else {
             Ok(PaymentState::Pending)
         }
@@ -423,10 +463,12 @@ mod tests {
         incoming_preimage: Option<String>,
         incoming_expired: bool,
         legacy_expiry: bool,
+        pending_expiry: bool,
         self_payment: bool,
         history: Vec<Value>,
         history_error: bool,
         outgoing: String,
+        pay_error: Option<String>,
         wrong_proof: bool,
         omit_pay_response: bool,
         wrong_amount: bool,
@@ -533,7 +575,7 @@ mod tests {
                             "lookup_invoice" => {
                                 let hash = request["params"]["payment_hash"].as_str().unwrap();
                                 if hash == in_hash {
-                                    json!({"type":if state.self_payment {"outgoing"} else {"incoming"},"state":if state.incoming_paid {Some("settled")} else if state.incoming_expired {Some("expired")} else if state.legacy_expiry {None} else {Some("pending")},"expires_at":if state.legacy_expiry {Some(1)} else {None},"payment_hash":in_hash,"preimage":state.incoming_preimage,"amount":500000,"fees_paid":0,"created_at":1,"settled_at":if state.incoming_paid {Some(2)} else {None}})
+                                    json!({"type":if state.self_payment {"outgoing"} else {"incoming"},"state":if state.incoming_paid {Some("settled")} else if state.incoming_expired {Some("expired")} else if state.legacy_expiry {None} else {Some("pending")},"expires_at":if state.legacy_expiry || state.pending_expiry {Some(1)} else {None},"payment_hash":in_hash,"preimage":state.incoming_preimage,"amount":500000,"fees_paid":0,"created_at":1,"settled_at":if state.incoming_paid {Some(2)} else {None}})
                                 } else if hash == out_hash {
                                     json!({"type":"outgoing","state":if state.outgoing.is_empty() {"pending"} else {&state.outgoing},"payment_hash":out_hash,"preimage":if state.outgoing=="settled" {Some(hex::encode([8;32]))} else {None},"amount":8000,"fees_paid":1500,"created_at":1,"settled_at":if state.outgoing=="settled" {Some(2)} else {None}})
                                 } else {
@@ -555,12 +597,18 @@ mod tests {
                                 if state.omit_pay_response {
                                     continue;
                                 }
-                                json!({"preimage":hex::encode(if state.wrong_proof {[9;32]} else {[8;32]}),"fees_paid":1500})
+                                if let Some(code) = &state.pay_error {
+                                    json!({"_payment_error":code})
+                                } else {
+                                    json!({"preimage":hex::encode(if state.wrong_proof {[9;32]} else {[8;32]}),"fees_paid":1500})
+                                }
                             }
                             _ => panic!("unexpected method"),
                         };
                         if result["_lookup_error"].as_bool() == Some(true) {
                             json!({"result_type":method,"error":{"code":"NOT_FOUND","message":"unknown nostr+walletconnect://secret-must-not-leak"},"result":null})
+                        } else if let Some(code) = result["_payment_error"].as_str() {
+                            json!({"result_type":method,"error":{"code":code,"message":"secret-wallet-error-must-not-leak"},"result":null})
                         } else {
                             json!({"result_type":method,"error":null,"result":result})
                         }
@@ -855,13 +903,23 @@ mod tests {
             wallet.invoice_state(&hash).await.unwrap(),
             InvoiceState::Expired
         );
-        service.state.lock().unwrap().wrong_proof = true;
+        {
+            let mut state = service.state.lock().unwrap();
+            state.legacy_expiry = false;
+            state.pending_expiry = true;
+        }
         assert_eq!(
-            wallet
-                .pay_invoice(&service.outgoing, NWC_WALLET_MANAGED_FEES)
-                .await
-                .unwrap(),
-            PaymentState::Pending
+            wallet.invoice_state(&hash).await.unwrap(),
+            InvoiceState::Expired
+        );
+        service.state.lock().unwrap().wrong_proof = true;
+        let error = wallet
+            .pay_invoice(&service.outgoing, NWC_WALLET_MANAGED_FEES)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WalletIssue>(),
+            Some(&WalletIssue::InvalidProof)
         );
         let hash = wallet
             .decode_invoice(&service.outgoing)
@@ -872,6 +930,19 @@ mod tests {
             wallet.payment_state(&hash).await.unwrap(),
             PaymentState::Failed { .. }
         ));
+        service.state.lock().unwrap().outgoing = "expired".into();
+        assert!(wallet.payment_state(&hash).await.is_err());
+        assert_eq!(
+            service
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|method| method.as_str() == "pay_invoice")
+                .count(),
+            1
+        );
         service.state.lock().unwrap().wrong_amount = true;
         assert!(wallet.create_invoice(500, "entry", 600).await.is_err());
         assert!(
@@ -883,19 +954,81 @@ mod tests {
         service.stop().await;
     }
     #[tokio::test]
+    async fn wallet_rejections_are_classified_without_exposing_provider_messages() {
+        let service = Service::start(Nip47Ciphers::NIP44V2, METHODS, "bitcoin").await;
+        let wallet = NwcWallet::connect(&service.uri).await.unwrap();
+        for (code, issue) in [
+            ("RATE_LIMITED", WalletIssue::RateLimited),
+            ("INSUFFICIENT_BALANCE", WalletIssue::InsufficientBalance),
+            ("QUOTA_EXCEEDED", WalletIssue::QuotaExceeded),
+            ("RESTRICTED", WalletIssue::Restricted),
+            ("UNAUTHORIZED", WalletIssue::Unauthorized),
+        ] {
+            service.state.lock().unwrap().pay_error = Some(code.into());
+            let result = wallet
+                .pay_invoice(&service.outgoing, NWC_WALLET_MANAGED_FEES)
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                PaymentState::Failed {
+                    reason: issue.to_string()
+                }
+            );
+            assert!(!format!("{result:?}").contains("secret-wallet-error"));
+        }
+        service.state.lock().unwrap().pay_error = Some("PAYMENT_FAILED".into());
+        let error = wallet
+            .pay_invoice(&service.outgoing, NWC_WALLET_MANAGED_FEES)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WalletIssue>(),
+            Some(&WalletIssue::ReportedFailure)
+        );
+        assert!(!error.to_string().contains("secret-wallet-error"));
+        wallet.shutdown().await;
+        service.stop().await;
+    }
+    #[tokio::test]
+    async fn failed_read_replaces_the_session_and_keeps_the_wallet_identity() {
+        let service = Service::start(Nip47Ciphers::NIP44V2, METHODS, "bitcoin").await;
+        let wallet = NwcWallet::connect_with_timeout(&service.uri, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let identity = wallet.identity();
+        let old = wallet.client();
+        old.shutdown().await;
+        assert!(wallet.create_invoice(500, "first", 60).await.is_err());
+        let replacement = wallet.client();
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert_eq!(wallet.identity(), identity);
+        let invoice = wallet.create_invoice(500, "retry", 60).await.unwrap();
+        assert_eq!(
+            wallet.decode_invoice(&invoice.bolt11).unwrap().amount_sats,
+            Some(500)
+        );
+        wallet.shutdown().await;
+        service.stop().await;
+    }
+
+    #[tokio::test]
     async fn lost_payment_response_is_looked_up_without_repeating_payment() {
         let service = Service::start(Nip47Ciphers::NIP44V2, METHODS, "bitcoin").await;
         let wallet = NwcWallet::connect_with_timeout(&service.uri, Duration::from_secs(1))
             .await
             .unwrap();
         service.state.lock().unwrap().omit_pay_response = true;
+        let original_client = wallet.client();
+        let error = wallet
+            .pay_invoice(&service.outgoing, NWC_WALLET_MANAGED_FEES)
+            .await
+            .unwrap_err();
         assert_eq!(
-            wallet
-                .pay_invoice(&service.outgoing, NWC_WALLET_MANAGED_FEES)
-                .await
-                .unwrap(),
-            PaymentState::Pending
+            error.downcast_ref::<WalletIssue>(),
+            Some(&WalletIssue::Timeout)
         );
+        assert!(!Arc::ptr_eq(&original_client, &wallet.client()));
         let hash = wallet
             .decode_invoice(&service.outgoing)
             .unwrap()

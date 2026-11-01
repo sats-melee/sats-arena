@@ -49,12 +49,14 @@ struct Payment {
     sats: u64,
     address: String,
     kind: &'static str,
+    memo: String,
     state: PayoutState,
     prepared: bool,
     confirmed_at_ms: Option<u64>,
     simulated: bool,
     collecting_until_ms: Option<u64>,
     replaced_by: Option<String>,
+    recovery_note: String,
 }
 
 fn payments(saved: &Saved) -> Vec<Payment> {
@@ -75,12 +77,29 @@ fn payments(saved: &Saved) -> Vec<Payment> {
                 Reason::Return => "Refund",
                 Reason::Settlement => "Settlement",
             },
+            memo: prepared
+                .filter(|p| !p.memo.is_empty())
+                .map(|p| p.memo.clone())
+                .unwrap_or_else(|| payout_memo(&saved.pot, payout)),
             state: payout.state,
             prepared: prepared.is_some(),
             confirmed_at_ms: prepared.and_then(|p| p.confirmed_at_ms),
             simulated: saved.simulated,
             collecting_until_ms: None,
             replaced_by: saved.pot.payout_replacements.get(&payout.id).cloned(),
+            recovery_note: saved
+                .recovery
+                .get(&payout.id)
+                .map(|r| {
+                    if payout.state == PayoutState::Paid {
+                        format!("Confirmed after {} failed attempts", r.failed.len())
+                    } else {
+                        r.description()
+                    }
+                })
+                .unwrap_or_default() + &saved.group_leader(&payout.id).map(|leader|
+                    format!("; allocation in combined transfer {leader} ({} sats total; one wallet send)", saved.group_sats(leader).unwrap_or(0)))
+                    .unwrap_or_default(),
         });
     }
     for entry in &saved.retired_entries {
@@ -93,12 +112,24 @@ fn payments(saved: &Saved) -> Vec<Payment> {
             sats,
             address: entry.address.clone(),
             kind: "Late entry refund",
+            memo: "Late entry refund".into(),
             state: entry.state,
             prepared: entry.prepared.is_some(),
             confirmed_at_ms: entry.prepared.as_ref().and_then(|p| p.confirmed_at_ms),
             simulated: saved.simulated,
             collecting_until_ms: None,
             replaced_by: None,
+            recovery_note: saved
+                .recovery
+                .get(&format!("late-entry-{}", entry.incoming_hash))
+                .map(|r| {
+                    if entry.state == PayoutState::Paid {
+                        format!("Confirmed after {} failed attempts", r.failed.len())
+                    } else {
+                        r.description()
+                    }
+                })
+                .unwrap_or_default(),
         });
     }
     rows
@@ -182,6 +213,7 @@ impl History {
             let sats = demo.saved.pot.unbatched[player];
             if sats > 0 {
                 let id = format!("{}-open-P{}", demo.saved.pot.id, player + 1);
+                let targets = damage_targets(&demo.saved.pot.unbatched_damage_sources[player]);
                 rows.insert(
                     id.clone(),
                     Payment {
@@ -190,24 +222,31 @@ impl History {
                         sats,
                         address: demo.saved.addresses[player].clone(),
                         kind: "Damage batch",
+                        memo: if targets.is_empty() {
+                            "Damage batch".into()
+                        } else {
+                            format!("Damage to {targets}")
+                        },
                         state: PayoutState::Created,
                         prepared: false,
                         confirmed_at_ms: None,
                         simulated: demo.saved.simulated,
                         collecting_until_ms: demo.saved.pot.batch_deadline_ms[player],
                         replaced_by: None,
+                        recovery_note: String::new(),
                     },
                 );
             }
         }
         let count = |state| rows.values().filter(|row| row.state == state).count();
         let mut text = format!(
-            "{} outbound payments / open batches\n{} queued | {} sending or awaiting confirmation | {} paid | {} failed\n",
+            "{} outbound payments / open batches\n{} queued | {} sending or awaiting confirmation | {} paid | {} failed | {} discarded\n",
             rows.len(),
             count(PayoutState::Created),
             count(PayoutState::InFlight),
             count(PayoutState::Paid),
             count(PayoutState::Failed),
+            count(PayoutState::Discarded),
         );
         if count(PayoutState::Superseded) > 0 {
             let _ = writeln!(
@@ -231,6 +270,7 @@ impl History {
                     PayoutState::InFlight => 2,
                     PayoutState::Paid => 3,
                     PayoutState::Superseded => 4,
+                    PayoutState::Discarded => 5,
                 },
                 row.id.clone(),
             )
@@ -242,6 +282,7 @@ impl History {
                 PayoutState::Paid => "PAID",
                 PayoutState::Failed => "FAILED",
                 PayoutState::Superseded => "CONSOLIDATED",
+                PayoutState::Discarded => "DISCARDED",
             };
             let simulated = if row.simulated { " / SIMULATED" } else { "" };
             let _ = writeln!(
@@ -252,6 +293,11 @@ impl History {
                 row.kind
             );
             let _ = writeln!(text, "To: {}\nID: {}", row.address, row.id);
+            let _ = writeln!(
+                text,
+                "For: {}",
+                row.memo.strip_prefix("Sats Melee — ").unwrap_or(&row.memo)
+            );
             if let Some(replacement) = row.replaced_by {
                 let _ = writeln!(text, "Replaced by: {replacement}");
             }
@@ -277,6 +323,9 @@ impl History {
                     seconds / 60 % 60,
                     seconds % 60
                 );
+            }
+            if !row.recovery_note.is_empty() {
+                let _ = writeln!(text, "Recovery: {}", row.recovery_note);
             }
         }
         text
@@ -395,18 +444,29 @@ mod tests {
             prepared: None,
             state: PayoutState::Failed,
         });
+        demo.saved.pot.payouts.push(Payout {
+            id: "discarded-payout".into(),
+            player: 0,
+            sats: 9,
+            reason: Reason::Damage,
+            state: PayoutState::Discarded,
+        });
         demo.save().unwrap();
         let before = serde_json::to_value(&demo.saved).unwrap();
         let on_disk = std::fs::read(&demo.path).unwrap();
         let text = History::default().render(&demo);
-        assert!(text.starts_with("124 outbound payments / open batches\n121 queued | 1 sending or awaiting confirmation | 1 paid | 1 failed\n"));
+        assert!(text.starts_with("125 outbound payments / open batches\n121 queued | 1 sending or awaiting confirmation | 1 paid | 1 failed | 1 discarded\n"));
         assert!(text.len() > 4096);
         assert!(text.contains("ID: current-payout-119\n"));
         assert!(text.contains("[IN FLIGHT] P2 / 23 sats"));
         assert_eq!(text.matches("ID: recovering-payout\n").count(), 1);
         assert!(text.contains("[PAID] P2 / 23 sats"));
         assert!(text.contains("[FAILED] P2 / 10 sats / Late entry refund"));
-        assert!(text.contains("To: locked@example.test\nID: current-payout-000\nQueued to send"));
+        assert!(text.contains("[DISCARDED] P1 / 9 sats / Damage"));
+        assert!(text.contains("Discarded without sending; funds retained by host"));
+        assert!(text.contains(
+            "To: locked@example.test\nID: current-payout-000\nFor: Damage payout\nQueued to send"
+        ));
         assert!(text.contains("Collecting batch; due in"));
         assert!(!text.contains("invoice-must-not-appear"));
         assert!(!text.contains("hash-must-not-appear"));
@@ -446,6 +506,7 @@ mod tests {
     fn ffi_delivers_complete_utf8_and_never_partially_writes_a_short_buffer() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let handle = LocalHandle {
+            room_status: Default::default(),
             sender,
             shared: Arc::new(Mutex::new(LocalView::default())),
             outbound: Arc::new(DebugView::default()),

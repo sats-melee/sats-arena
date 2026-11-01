@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod rooms;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -17,6 +18,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+
+    if std::env::args().nth(1).as_deref() == Some("rooms") {
+        return rooms::serve(std::env::args().skip(2)).await;
+    }
 
     let path = std::env::args_os()
         .nth(1)
