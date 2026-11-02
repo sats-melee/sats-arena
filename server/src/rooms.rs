@@ -495,6 +495,14 @@ async fn asset(rooms: Rooms, file: &str) -> Response {
         "text/javascript; charset=utf-8"
     } else if file.ends_with(".css") {
         "text/css; charset=utf-8"
+    } else if file.ends_with(".png") {
+        "image/png"
+    } else if file.ends_with(".svg") {
+        "image/svg+xml"
+    } else if file.ends_with(".woff2") {
+        "font/woff2"
+    } else if file.ends_with(".txt") {
+        "text/plain; charset=utf-8"
     } else {
         return StatusCode::NOT_FOUND.into_response();
     };

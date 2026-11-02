@@ -2,6 +2,9 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
+const logo = new URL("./assets/sats-melee-logo.png", import.meta.url).href;
+const icon = new URL("./assets/sats-melee-icon.svg", import.meta.url).href;
+
 type Player = {
   kind: number;
   address: string;
@@ -121,7 +124,11 @@ function App() {
             setPending(false);
             setNotice("Desktop is reconnecting. Your player slot is saved.");
           } else {
-            setNotice(previous => previous === "Desktop is reconnecting. Your player slot is saved." ? "" : previous);
+            setNotice((previous) =>
+              previous === "Desktop is reconnecting. Your player slot is saved."
+                ? ""
+                : previous
+            );
           }
         } else if (message.type === "error") {
           setError(message.message);
@@ -224,312 +231,336 @@ function App() {
       .filter((p) => p.kind < 2) ?? [];
 
   return (
-    <main>
+    <>
       <header>
-        <a className="brand" href="/">
-          SATS<span>MELEE</span>
+        <a className="brand" href="/" aria-label="Sats Melee home">
+          <img
+            src={logo}
+            alt="Super Sats Bros. Melee"
+            width="170"
+            height="95"
+          />
         </a>
-        <span className="eyebrow">PHONE ROOM</span>
+        <span className="room-badge">
+          <img src={icon} alt="" width="20" height="20" />
+          Phone room
+        </span>
       </header>
-      {!joined ? (
-        <section className="join card">
-          <p className="eyebrow accent">LOCAL PLAY. YOUR PHONE.</p>
-          <h1>Grab your spot.</h1>
-          <p className="muted">
-            Enter the room code shown in Sats Melee, then choose your controller
-            slot.
-          </p>
-          <form onSubmit={join}>
-            <label htmlFor="code">Room code</label>
-            <input
-              id="code"
-              className="code-input"
-              value={code}
-              maxLength={6}
-              minLength={6}
-              pattern="[A-Za-z2-9]{6}"
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-              autoCapitalize="characters"
-              autoComplete="off"
-              spellCheck={false}
-              required
-              placeholder="ABCDEF"
-            />
-            <label htmlFor="player">Your controller</label>
-            <select
-              id="player"
-              value={player}
-              onChange={(e) => setPlayer(Number(e.target.value))}
-            >
-              {[0, 1, 2, 3].map((i) => (
-                <option value={i} key={i}>
-                  Player {i + 1}
-                </option>
-              ))}
-            </select>
-            <button type="submit" disabled={!!membership}>
-              {membership ? "Connecting…" : "Join room"}
-            </button>
-            {membership && (
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => {
-                  credentials.current = null;
-                  setMembership(null);
-                }}
+      <main>
+        {!joined ? (
+          <section className="join card">
+            <h1>Join a room</h1>
+            <p className="muted">
+              Enter the room code shown in Sats Melee, then choose your
+              controller slot.
+            </p>
+            <form onSubmit={join}>
+              <label htmlFor="code">Room code</label>
+              <input
+                id="code"
+                className="code-input"
+                value={code}
+                maxLength={6}
+                minLength={6}
+                pattern="[A-Za-z2-9]{6}"
+                onChange={(e) => setCode(e.target.value.toUpperCase())}
+                autoCapitalize="characters"
+                autoComplete="off"
+                spellCheck={false}
+                required
+                placeholder="ABCDEF"
+              />
+              <label htmlFor="player">Your controller</label>
+              <select
+                id="player"
+                value={player}
+                onChange={(e) => setPlayer(Number(e.target.value))}
               >
-                Cancel reconnect
+                {[0, 1, 2, 3].map((i) => (
+                  <option value={i} key={i}>
+                    Player {i + 1}
+                  </option>
+                ))}
+              </select>
+              <button type="submit" disabled={!!membership}>
+                {membership ? "Connecting…" : "Join room"}
               </button>
-            )}
-          </form>
-        </section>
-      ) : (
-        <>
-          <div className="room-heading">
-            <div>
-              <p className="eyebrow">ROOM</p>
-              <h1 className="room-code">{membership?.code}</h1>
-            </div>
-            <span
-              className={`status ${connected && online ? "live" : ""}`}
-              role="status"
-            >
-              {connected && online ? "Connected" : "Reconnecting…"}
-            </span>
-          </div>
-          {snapshot && (
-            <>
-              <p className="muted">
-                {phases[snapshot.phase] ?? "Waiting for game"}
-                {snapshot.mode !== "lightning" && (
-                  <strong className="test-mode">
-                    {" "}
-                    ·{" "}
-                    {snapshot.mode === "sandbox"
-                      ? "Sandbox · test sats only"
-                      : "Simulated · no bitcoin"}
-                  </strong>
-                )}
-              </p>
-              <section className="card personal">
-                <div className="section-heading">
-                  <h2>Player {(membership?.player ?? 0) + 1}</h2>
-                  <span className="pill">
-                    {own?.paid_sats ? "Entry paid" : "Entry unpaid"}
-                  </span>
-                </div>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (canEdit)
-                      send("set_address", {
-                        match_id: snapshot.match_id,
-                        address: address.trim(),
-                      });
+              {membership && (
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    credentials.current = null;
+                    setMembership(null);
                   }}
                 >
-                  <label htmlFor="address">Receiving Lightning Address</label>
-                  <input
-                    id="address"
-                    type="text"
-                    inputMode="email"
-                    autoCapitalize="none"
-                    autoCorrect="off"
-                    spellCheck={false}
-                    placeholder="you@example.com"
-                    value={address}
-                    maxLength={127}
-                    disabled={!canEdit || pending}
-                    onChange={(e) => {
-                      dirty.current = true;
-                      setAddress(e.target.value);
-                    }}
-                    required
-                  />
-                  <button
-                    className="secondary"
-                    disabled={!canEdit || pending || !address.trim()}
-                  >
-                    Save address
-                  </button>
-                </form>
-                <p className="muted" role="status">
-                  {own?.message ||
-                    "Save the address where you want to receive your payouts."}
+                  Cancel reconnect
+                </button>
+              )}
+            </form>
+          </section>
+        ) : (
+          <>
+            <div className="room-heading">
+              <div>
+                <p className="eyebrow">ROOM</p>
+                <h1 className="room-code">{membership?.code}</h1>
+              </div>
+              <span
+                className={`status ${connected && online ? "live" : ""}`}
+                role="status"
+              >
+                {connected && online ? "Connected" : "Reconnecting…"}
+              </span>
+            </div>
+            {snapshot && (
+              <>
+                <p className="muted">
+                  {phases[snapshot.phase] ?? "Waiting for game"}
+                  {snapshot.mode !== "lightning" && (
+                    <strong className="test-mode">
+                      {" "}
+                      ·{" "}
+                      {snapshot.mode === "sandbox"
+                        ? "Sandbox · test sats only"
+                        : "Simulated · no bitcoin"}
+                    </strong>
+                  )}
                 </p>
-                <div className="entry">
-                  <div>
-                    <span className="eyebrow">ENTRY</span>
-                    <p className="amount">
-                      {sats(snapshot.invoice_sats)} <small>sats</small>
-                    </p>
+                <section
+                  className={`card personal player-${membership?.player ?? 0}`}
+                >
+                  <div className="section-heading">
+                    <h2>Player {(membership?.player ?? 0) + 1}</h2>
+                    <span className="pill">
+                      {own?.paid_sats ? "Entry paid" : "Entry unpaid"}
+                    </span>
                   </div>
-                  <button
-                    disabled={!canInvoice || pending}
-                    onClick={() => {
-                      setRequestedFor(snapshot.match_id);
-                      send("request_invoice", { match_id: snapshot.match_id });
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (canEdit)
+                        send("set_address", {
+                          match_id: snapshot.match_id,
+                          address: address.trim(),
+                        });
                     }}
                   >
-                    {own?.paid_sats ? "Paid" : "Get entry invoice"}
-                  </button>
-                </div>
-                {snapshot.invoice_sats > snapshot.entry_sats && (
-                  <p className="muted small">
-                    {sats(snapshot.entry_sats)} sats into play +{" "}
-                    {sats(snapshot.invoice_sats - snapshot.entry_sats)} sats
-                    retained for routing.
+                    <label htmlFor="address">Receiving Lightning Address</label>
+                    <input
+                      id="address"
+                      type="text"
+                      inputMode="email"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      placeholder="you@example.com"
+                      value={address}
+                      maxLength={127}
+                      disabled={!canEdit || pending}
+                      onChange={(e) => {
+                        dirty.current = true;
+                        setAddress(e.target.value);
+                      }}
+                      required
+                    />
+                    <button
+                      className="secondary"
+                      disabled={!canEdit || pending || !address.trim()}
+                    >
+                      Save address
+                    </button>
+                  </form>
+                  <p className="muted" role="status">
+                    {own?.message ||
+                      "Save the address where you want to receive your payouts."}
                   </p>
-                )}
-                {requestedFor === snapshot.match_id && !own?.paid_sats && (
-                  <div className="invoice">
-                    {own?.invoice && connected && online ? (
-                      <>
-                        <a className="button" href={`lightning:${own.invoice}`}>
-                          Open Lightning wallet
-                        </a>
-                        <button
-                          className="secondary"
-                          onClick={async () => {
-                            setError("");
-                            try {
-                              await navigator.clipboard.writeText(own.invoice);
-                              setNotice("Invoice copied.");
-                            } catch {
-                              const field = invoiceField.current;
-                              const details = field?.closest("details");
-                              if (details) details.open = true;
-                              field?.focus();
-                              field?.select();
-                              setNotice("Invoice selected. Use your browser’s Copy command.");
-                            }
-                          }}
-                        >
-                          Copy invoice
-                        </button>
-                        <details>
-                          <summary>Show invoice</summary>
-                          <textarea
-                            ref={invoiceField}
-                            aria-label="Entry invoice"
-                            readOnly
-                            value={own.invoice}
-                          />
-                        </details>
-                      </>
-                    ) : (
-                      <p className="muted">
-                        Waiting for the desktop to verify your address and create
-                        your invoice. You can pay before choosing a character.
+                  <div className="entry">
+                    <div>
+                      <span className="eyebrow">ENTRY</span>
+                      <p className="amount">
+                        {sats(snapshot.invoice_sats)} <small>sats</small>
                       </p>
-                    )}
+                    </div>
+                    <button
+                      disabled={!canInvoice || pending}
+                      onClick={() => {
+                        setRequestedFor(snapshot.match_id);
+                        send("request_invoice", {
+                          match_id: snapshot.match_id,
+                        });
+                      }}
+                    >
+                      {own?.paid_sats ? "Paid" : "Get entry invoice"}
+                    </button>
                   </div>
-                )}
-              </section>
-              <section aria-label="Player totals" className="players">
-                {activePlayers.map((p) => (
-                  <article className="card score" key={p.index}>
-                    <p className="eyebrow">
-                      PLAYER {p.index + 1}
-                      {p.kind === 1 ? " · CPU" : ""}
-                    </p>
-                    <h2>
-                      {percent(
-                        snapshot.damage_centi[p.index].reduce(
-                          (sum, n) => sum + n,
-                          0
-                        )
-                      )}
-                      <small>% dealt</small>
-                    </h2>
-                    <p>
-                      <strong>{sats(p.earned_sats)}</strong> sats earned
-                    </p>
+                  {snapshot.invoice_sats > snapshot.entry_sats && (
                     <p className="muted small">
-                      {sats(p.pending_sats)} sats pending
+                      {sats(snapshot.entry_sats)} sats into play +{" "}
+                      {sats(snapshot.invoice_sats - snapshot.entry_sats)} sats
+                      retained for routing.
                     </p>
-                  </article>
-                ))}
-              </section>
-              <section className="card">
-                <h2>Damage</h2>
-                <p className="muted small">
-                  Finalized damage dealt, across all stocks.
-                </p>
-                <div className="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th scope="col">From / to</th>
-                        {activePlayers.map((p) => (
-                          <th scope="col" key={p.index}>
-                            P{p.index + 1}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {activePlayers.map((p) => (
-                        <tr key={p.index}>
-                          <th scope="row">P{p.index + 1}</th>
-                          {activePlayers.map((v) => (
-                            <td key={v.index}>
-                              {p.index === v.index
-                                ? "—"
-                                : `${percent(
-                                    snapshot.damage_centi[p.index][v.index]
-                                  )}%`}
-                            </td>
+                  )}
+                  {requestedFor === snapshot.match_id && !own?.paid_sats && (
+                    <div className="invoice">
+                      {own?.invoice && connected && online ? (
+                        <>
+                          <a
+                            className="button"
+                            href={`lightning:${own.invoice}`}
+                          >
+                            Open Lightning wallet
+                          </a>
+                          <button
+                            className="secondary"
+                            onClick={async () => {
+                              setError("");
+                              try {
+                                await navigator.clipboard.writeText(
+                                  own.invoice
+                                );
+                                setNotice("Invoice copied.");
+                              } catch {
+                                const field = invoiceField.current;
+                                const details = field?.closest("details");
+                                if (details) details.open = true;
+                                field?.focus();
+                                field?.select();
+                                setNotice(
+                                  "Invoice selected. Use your browser’s Copy command."
+                                );
+                              }
+                            }}
+                          >
+                            Copy invoice
+                          </button>
+                          <details>
+                            <summary>Show invoice</summary>
+                            <textarea
+                              ref={invoiceField}
+                              aria-label="Entry invoice"
+                              readOnly
+                              value={own.invoice}
+                            />
+                          </details>
+                        </>
+                      ) : (
+                        <p className="muted">
+                          Waiting for the desktop to verify your address and
+                          create your invoice. You can pay before choosing a
+                          character.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </section>
+                <section aria-label="Player totals" className="players">
+                  {activePlayers.map((p) => (
+                    <article
+                      className={`card score player-${p.index}`}
+                      key={p.index}
+                    >
+                      <p className="eyebrow">
+                        PLAYER {p.index + 1}
+                        {p.kind === 1 ? " · CPU" : ""}
+                      </p>
+                      <h2>
+                        {percent(
+                          snapshot.damage_centi[p.index].reduce(
+                            (sum, n) => sum + n,
+                            0
+                          )
+                        )}
+                        <small>% dealt</small>
+                      </h2>
+                      <p>
+                        <strong>{sats(p.earned_sats)}</strong> sats earned
+                      </p>
+                      <p className="muted small">
+                        {sats(p.pending_sats)} sats pending
+                      </p>
+                    </article>
+                  ))}
+                </section>
+                <section className="card">
+                  <h2>Damage</h2>
+                  <p className="muted small">
+                    Finalized damage dealt, across all stocks.
+                  </p>
+                  <div className="table-scroll">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th scope="col">From / to</th>
+                          {activePlayers.map((p) => (
+                            <th scope="col" key={p.index}>
+                              P{p.index + 1}
+                            </th>
                           ))}
                         </tr>
+                      </thead>
+                      <tbody>
+                        {activePlayers.map((p) => (
+                          <tr key={p.index}>
+                            <th scope="row">P{p.index + 1}</th>
+                            {activePlayers.map((v) => (
+                              <td key={v.index}>
+                                {p.index === v.index
+                                  ? "—"
+                                  : `${percent(
+                                      snapshot.damage_centi[p.index][v.index]
+                                    )}%`}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+                <section className="card">
+                  <h2>Payment activity</h2>
+                  <p className="muted small">
+                    Confirmed payments and pending activity reported by the
+                    desktop.
+                  </p>
+                  {snapshot.logs.length ? (
+                    <ol className="logs">
+                      {snapshot.logs.map((log, i) => (
+                        <li key={`${log.at_ms}-${i}`}>
+                          <time dateTime={new Date(log.at_ms).toISOString()}>
+                            {new Date(log.at_ms).toLocaleTimeString()}
+                          </time>
+                          <span>{log.message}</span>
+                        </li>
                       ))}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-              <section className="card">
-                <h2>Payment activity</h2>
-                <p className="muted small">
-                  Confirmed payments and pending activity reported by the
-                  desktop.
-                </p>
-                {snapshot.logs.length ? (
-                  <ol className="logs">
-                    {snapshot.logs.map((log, i) => (
-                      <li key={`${log.at_ms}-${i}`}>
-                        <time dateTime={new Date(log.at_ms).toISOString()}>
-                          {new Date(log.at_ms).toLocaleTimeString()}
-                        </time>
-                        <span>{log.message}</span>
-                      </li>
-                    ))}
-                  </ol>
-                ) : (
-                  <p className="muted">Payment activity will appear here.</p>
-                )}
-              </section>
-            </>
-          )}
-          <button
-            className="secondary leave"
-            disabled={!connected || !online || snapshot?.locked || pending}
-            onClick={() => send("leave")}
-          >
-            Leave room
-          </button>
-        </>
-      )}
-      <div className="feedback" aria-live="polite">
-        {error && (
-          <p role="alert" className="error">
-            {error}
-          </p>
+                    </ol>
+                  ) : (
+                    <p className="muted">Payment activity will appear here.</p>
+                  )}
+                </section>
+              </>
+            )}
+            <button
+              className="secondary leave"
+              disabled={!connected || !online || snapshot?.locked || pending}
+              onClick={() => send("leave")}
+            >
+              Leave room
+            </button>
+          </>
         )}
-        {notice && <p className="muted">{notice}</p>}
-      </div>
-      <footer>Keep playing on your controller. Your receipts stay here.</footer>
-    </main>
+        <div className="feedback" aria-live="polite">
+          {error && (
+            <p role="alert" className="error">
+              {error}
+            </p>
+          )}
+          {notice && <p className="muted">{notice}</p>}
+        </div>
+        <footer>Gameplay stays on your controller.</footer>
+      </main>
+    </>
   );
 }
 

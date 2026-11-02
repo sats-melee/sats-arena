@@ -102,6 +102,10 @@ the desktop to create a new code. This does not affect the desktop ledger or
 ongoing gameplay/payment recovery. Phone status goes offline while the desktop
 reconnects, and displayed invoices are disabled until it returns.
 
+The SPA uses the launcher's wordmark, charcoal/red palette, and bundled Rubik and
+Maven Pro fonts. Its tab icon and font licenses are included in the built assets;
+fonts load from your own server.
+
 The SPA currently shows the current match's pairwise damage and the desktop's
 last 100 payment activity entries. It does not add durable account history or
 change the existing archived desktop payment records.
