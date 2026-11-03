@@ -6,7 +6,52 @@ has no wallet connection, ledger, funding rules, payment execution, or controlle
 input stream. It relays player addresses and requests for the desktop's current
 entry invoice, and displays the desktop's damage totals and payment activity.
 
-## Run the server
+## Deploy on Fly.io
+
+The root `Dockerfile` builds the React frontend and Rust relay into one image.
+It runs `sats-arena-server rooms` on port 8080 as an unprivileged user, serving
+the built frontend from `/app/frontend`. No wallet credentials, database, volume,
+or Node installation are needed at runtime. The build context excludes local
+configuration, ledgers, dependencies, and build outputs.
+
+Install [flyctl](https://fly.io/docs/flyctl/install/), then run these commands
+from the repository root. Choose a globally unique app name:
+
+```sh
+fly auth login
+fly launch --copy-config --no-deploy --ha=false --name YOUR-UNIQUE-APP --region iad
+fly deploy --remote-only --ha=false
+```
+
+Fly builds the container remotely; the desktop does not host the service and
+does not need Docker installed. Fly's proxy supplies HTTPS and WebSocket
+upgrades. The included `fly.toml` checks `/health` and keeps the relay running.
+No reverse proxy container or wallet secrets are required.
+
+Keep **exactly one Machine in one region**: rooms are held in process memory,
+so independently routed replicas cannot share codes or slot claims. Always use
+`--ha=false` when deploying. If an existing app has extra Machines, run
+`fly scale count 1` before using it for rooms. Deployments briefly disconnect
+phones and cause the desktop to create a new room code; they do not affect the
+desktop payment ledger or gameplay. Automatic stopping is disabled so idle
+rooms keep their codes.
+
+After deployment, check the service and logs:
+
+```sh
+curl --fail https://YOUR-UNIQUE-APP.fly.dev/health
+fly status
+fly logs
+```
+
+Enable **Phone room** in the launcher and set its URL to
+`https://YOUR-UNIQUE-APP.fly.dev`, then reopen LOCAL. Open the same website on
+a phone and enter the code displayed by the desktop. This works across different
+networks without opening an inbound port on the desktop. Request an invoice
+from the phone and verify it matches the desktop's invoice before testing a
+payment with the normal Alby Sandbox workflow.
+
+## Run the server for development
 
 Use Node 22.12+ to build the SPA. Node/npm are build tools, not server runtime
 dependencies:

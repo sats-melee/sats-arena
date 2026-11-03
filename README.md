@@ -3,6 +3,8 @@
 Optional code-only [phone rooms](docs/phone-rooms.md) have a React app in
 `server/frontend` and a WebSocket relay (`sats-arena-server rooms`). They connect
 to the existing native LOCAL payment engine without moving wallet rules to the server.
+The included [Dockerfile](Dockerfile) and [Fly configuration](fly.toml) deploy
+the relay and website together; see [Fly.io setup](docs/phone-rooms.md#deploy-on-flyio).
 
 The local game supports **2–4 participants in free-for-all or team battles**.
 Every human verifies a Lightning Address and pays a fresh entry each match;
