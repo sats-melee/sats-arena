@@ -1,4 +1,4 @@
-# fly launch --copy-config --name YOUR-UNIQUE-APP replaces this name.
+# Public phone relay: https://melee.landaverde.io
 app = "sats-melee-rooms"
 primary_region = "iad"
 kill_signal = "SIGINT"

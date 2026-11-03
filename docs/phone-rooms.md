@@ -14,8 +14,15 @@ the built frontend from `/app/frontend`. No wallet credentials, database, volume
 or Node installation are needed at runtime. The build context excludes local
 configuration, ledgers, dependencies, and build outputs.
 
+The hosted relay for this workspace is
+[melee.landaverde.io](https://melee.landaverde.io). Use
+`https://melee.landaverde.io` in the launcher's **Phone room** setting.
+To update this configured app after signing in, run
+`fly deploy --remote-only --ha=false` from the repository root.
+
 Install [flyctl](https://fly.io/docs/flyctl/install/), then run these commands
-from the repository root. Choose a globally unique app name:
+from the repository root to create a separate deployment. Choose a globally
+unique app name:
 
 ```sh
 fly auth login
