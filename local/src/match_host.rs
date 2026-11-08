@@ -110,11 +110,39 @@ impl MatchHost {
         )
         .await?;
         runtime.io.serialize_submissions = true;
-        runtime.io.track_missed = true;
-        Ok(Self {
+        let mut host = Self {
             runtime,
             tick_failed: false,
-        })
+        };
+        host.resume_automatic_retries()?;
+        Ok(host)
+    }
+
+    fn resume_automatic_retries(&mut self) -> Result<()> {
+        if !self.runtime.saved.recovery.values().any(|r| r.missed) {
+            return Ok(());
+        }
+        let mut next = self.runtime.saved.clone();
+        for recovery in next.recovery.values_mut().filter(|r| r.missed) {
+            recovery.missed = false;
+            recovery.manual_ready = false;
+            if recovery.retry_at_ms.is_none()
+                && recovery.failed.len() < recovery.limit
+                && recovery.issue.is_some_and(|issue| issue.automatic_retry())
+                && let Some(failed) = recovery.failed.last()
+            {
+                recovery.retry_at_ms =
+                    Some(failed.at_ms.saturating_add(if recovery.failed.len() == 1 {
+                        5_000
+                    } else {
+                        15_000
+                    }));
+            }
+        }
+        // Hosted matches have no local Pay missed action; persist retry policy before dispatch.
+        Demo::persist_saved(&next, &self.runtime.path)?;
+        self.runtime.saved = next;
+        Ok(())
     }
 
     fn active(&self) -> Result<()> {
@@ -238,7 +266,10 @@ impl MatchHost {
     }
 
     pub async fn tick(&mut self) -> Result<()> {
-        let result = self.runtime.tick().await;
+        let result = match self.resume_automatic_retries() {
+            Ok(()) => self.runtime.tick().await,
+            Err(error) => Err(error),
+        };
         self.tick_failed = result.is_err();
         if matches!(&result, Err(Error::Internal(_))) {
             self.runtime.saved.frozen = true;

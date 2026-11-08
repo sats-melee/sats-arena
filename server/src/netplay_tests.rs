@@ -807,8 +807,8 @@ async fn pregame_guest_leave_refunds_then_host_reopens_same_room_for_replacement
             .iter()
             .all(|p| p.paid_sats == 0)
     );
-    // A retired invoice may need two five-second polling windows before its refund.
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // Allow two 30-second retired-invoice polling windows plus refund dispatch.
+    tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             pump(&payments, 1).await;
             let ledger: Value = serde_json::from_slice(

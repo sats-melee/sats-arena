@@ -64,6 +64,9 @@ restarts. The server locks this directory against another server or recovery
 process. It stores wallet identity, terms, hashed member tokens, agreed reports,
 and the existing shared payment ledger, without saving the wallet secret.
 Restart with the same wallet to recover original outgoing payment attempts.
+Temporary receiving-invoice failures retry automatically. Previously held hosted
+debts resume this policy on restart, preserving the normal retry budget and
+original hashes for uncertain sends; no local **Pay missed** action is required.
 
 Incoming receipts and outgoing invoice hashes belong to one entry or debt
 across every room sharing that wallet. The server rebuilds this ownership from
