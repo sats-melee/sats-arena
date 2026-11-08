@@ -1,5 +1,11 @@
 # Sats Arena payment engine
 
+Experimental [desktop netplay rooms](docs/netplay-rooms.md) use the existing
+phone-room server for in-game Create Room / Join Room. The launcher’s Rooms
+button opens native two-to-four-player rooms with optional server-managed
+payments. Direct internet play uses STUN and peer UDP; networks that block
+direct connections still need port forwarding or a gameplay relay.
+
 Optional code-only [phone rooms](docs/phone-rooms.md) have a React app in
 `server/frontend` and a WebSocket relay (`sats-arena-server rooms`). They connect
 to the existing native LOCAL payment engine without moving wallet rules to the server.

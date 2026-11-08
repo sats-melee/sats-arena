@@ -1,6 +1,7 @@
 //! Wallet-neutral local host for up to four funded humans and CPU participants.
 //! Simulated wallet, live receiving verification, ordered damage and team settlement.
 mod config;
+pub mod match_host;
 mod missed;
 mod outbound_debug;
 mod payment_io;
@@ -172,6 +173,10 @@ struct MatchSummary {
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     schema: u32,
+    #[serde(default)]
+    frozen: bool,
+    #[serde(default)]
+    host_mode: Option<String>,
     #[serde(default)]
     wallet_identity: Option<String>,
     #[serde(default)]
@@ -383,25 +388,32 @@ impl Demo {
         if let Some(roster) = roster {
             pot.configure(roster.teams, roster.kinds, roster.team_ids)?;
         }
-        let mut invoices = std::array::from_fn(|_| String::new());
-        let mut hashes = std::array::from_fn(|_| String::new());
+        let max_fee_sats = setting("SATS_ARENA_MAX_PAYOUT_FEE_SATS", default_fee_limit())?;
+        let mut saved = Self::unfunded(pot, simulated, max_fee_sats);
         for i in 0..4 {
-            if !simulated || !pot.participates(i) {
+            if !simulated || !saved.pot.participates(i) {
                 continue;
             }
             let invoice = wallet
-                .create_invoice(pot.invoice_sats(), &format!("{} P{}", pot.id, i + 1), 600)
+                .create_invoice(
+                    saved.pot.invoice_sats(),
+                    &format!("{} P{}", saved.pot.id, i + 1),
+                    600,
+                )
                 .await?;
-            invoices[i] = invoice.bolt11;
-            hashes[i] = invoice.payment_hash;
+            saved.invoices[i] = invoice.bolt11;
+            saved.hashes[i] = invoice.payment_hash;
         }
-        let used_entry_hashes = hashes
-            .iter()
-            .filter(|hash| !hash.is_empty())
-            .cloned()
-            .collect();
-        Ok(Saved {
+        saved
+            .used_entry_hashes
+            .extend(saved.hashes.iter().filter(|hash| !hash.is_empty()).cloned());
+        Ok(saved)
+    }
+    fn unfunded(pot: MatchPot, simulated: bool, max_fee_sats: u64) -> Saved {
+        Saved {
             schema: 5,
+            frozen: false,
+            host_mode: None,
             wallet_identity: None,
             invoice_addresses: Default::default(),
             retired_entries: vec![],
@@ -413,20 +425,20 @@ impl Demo {
             activity: vec![],
             log_version: 1,
             pot,
-            invoices,
-            hashes,
+            invoices: Default::default(),
+            hashes: Default::default(),
             addresses: std::array::from_fn(|_| String::new()),
             prepared: BTreeMap::new(),
             used_payment_hashes: BTreeSet::new(),
-            used_entry_hashes,
+            used_entry_hashes: BTreeSet::new(),
             receipts: vec![],
             simulated,
             verification: Default::default(),
             verified_addresses: BTreeMap::new(),
             recovery: BTreeMap::new(),
             payout_groups: BTreeMap::new(),
-            max_fee_sats: setting("SATS_ARENA_MAX_PAYOUT_FEE_SATS", default_fee_limit())?,
-        })
+            max_fee_sats,
+        }
     }
     async fn open(folder: &Path) -> Result<Self> {
         std::fs::create_dir_all(folder).map_err(|e| Error::Internal(e.into()))?;
@@ -555,6 +567,16 @@ impl Demo {
         simulation: Option<Arc<FakeWallet>>,
         verifier: Arc<dyn AddressVerifier>,
     ) -> Result<Self> {
+        Self::open_with_match(folder, wallet, provider, simulation, verifier, None).await
+    }
+    async fn open_with_match(
+        folder: &Path,
+        wallet: Arc<dyn Wallet>,
+        provider: Arc<dyn AddressInvoices>,
+        simulation: Option<Arc<FakeWallet>>,
+        verifier: Arc<dyn AddressVerifier>,
+        hosted: Option<match_host::HostedOpen>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(folder).map_err(|e| Error::Internal(e.into()))?;
         let mut lock_options = std::fs::OpenOptions::new();
         lock_options
@@ -622,9 +644,40 @@ impl Demo {
                 }
             }
             serde_json::from_value(json)?
+        } else if let Some(hosted) = &hosted {
+            let mut saved = Self::unfunded(
+                hosted.pot.clone(),
+                false,
+                sats_arena_core::wallet::NWC_WALLET_MANAGED_FEES,
+            );
+            saved.wallet_identity = Some(hosted.identity.clone());
+            saved.host_mode = Some(hosted.mode.clone());
+            saved.roster = Some(Roster {
+                teams: false,
+                kinds: [0, 0, 3, 3],
+                team_ids: [255; 4],
+                characters: [255; 4],
+            });
+            saved
         } else {
             Self::fresh(wallet.as_ref(), simulation.is_some()).await?
         };
+        if let Some(hosted) = &hosted {
+            let pot = &saved.pot;
+            if saved.schema != 5
+                || saved.wallet_identity.as_deref() != Some(hosted.identity.as_str())
+                || saved.host_mode.as_deref() != Some(hosted.mode.as_str())
+                || pot.id != hosted.pot.id
+                || pot.entry_sats != hosted.pot.entry_sats
+                || pot.sats_per_percent != hosted.pot.sats_per_percent
+                || pot.batch_window_ms != hosted.pot.batch_window_ms
+                || pot.surcharge_bps != hosted.pot.surcharge_bps
+            {
+                return Err(Error::Rejected(
+                    "Stored match belongs to different terms or wallet".into(),
+                ));
+            }
+        }
         if saved.simulated != simulation.is_some() {
             return Err(Error::Rejected(
                 "payment state belongs to a different wallet mode".into(),
@@ -700,8 +753,13 @@ impl Demo {
             io: payment_io::PaymentIo::default(),
             _state_lock: state_lock,
         };
-        demo.io.set_submission_rate(submission_rate_setting()?)?;
-        if matches!(demo.saved.pot.phase, Phase::Funding | Phase::Ready)
+        demo.io.set_submission_rate(if hosted.is_some() {
+            1
+        } else {
+            submission_rate_setting()?
+        })?;
+        if hosted.is_none()
+            && matches!(demo.saved.pot.phase, Phase::Funding | Phase::Ready)
             && !demo.saved.pot.paid.iter().any(|p| *p)
         {
             let cpu_wallets = cpu_wallets_setting(demo.saved.pot.cpu_wallets)?;
@@ -814,6 +872,7 @@ impl Demo {
             .map_err(|e| Error::Internal(e.into()))?;
         file.sync_all().map_err(|e| Error::Internal(e.into()))?;
         std::fs::rename(temporary, path).map_err(|e| Error::Internal(e.into()))?;
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)
                 .and_then(|dir| dir.sync_all())

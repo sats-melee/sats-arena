@@ -1719,21 +1719,28 @@ name = "sats-arena-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "fs2",
  "futures-util",
+ "hex",
  "hyper",
  "hyper-util",
  "rand 0.9.5",
  "sats-arena-core",
+ "sats-arena-local",
  "sats-arena-protocol",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

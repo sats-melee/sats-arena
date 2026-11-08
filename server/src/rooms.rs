@@ -525,6 +525,13 @@ async fn asset(rooms: Rooms, file: &str) -> Response {
 }
 
 pub(crate) fn router(frontend: PathBuf) -> Router {
+    router_with_payments(frontend, None)
+}
+
+pub(crate) fn router_with_payments(
+    frontend: PathBuf,
+    payments: Option<crate::payments::Payments>,
+) -> Router {
     let rooms = Rooms {
         rooms: Default::default(),
         frontend,
@@ -573,11 +580,19 @@ pub(crate) fn router(frontend: PathBuf) -> Router {
             ),
         )
         .with_state(rooms)
+        .merge(match payments {
+            Some(payments) => crate::netplay::router_with(Some(payments)),
+            None => crate::netplay::router(),
+        })
 }
 
 pub(crate) async fn serve(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let mut bind = "127.0.0.1:8738".to_owned();
     let mut frontend = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("frontend/dist");
+    let mut payment_state: Option<PathBuf> = None;
+    let mut wallet_file: Option<PathBuf> = None;
+    let mut refund: Option<String> = None;
+    let mut reason: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => {
@@ -591,14 +606,77 @@ pub(crate) async fn serve(mut args: impl Iterator<Item = String>) -> anyhow::Res
                     .ok_or_else(|| anyhow::anyhow!("--frontend requires a directory"))?
                     .into()
             }
+            "--payment-state" => {
+                payment_state = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--payment-state requires a directory"))?
+                        .into(),
+                )
+            }
+            "--payment-wallet-file" => {
+                wallet_file = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--payment-wallet-file requires a private file")
+                        })?
+                        .into(),
+                )
+            }
+            "--refund-after-review" => {
+                refund =
+                    Some(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--refund-after-review requires a match ID")
+                    })?)
+            }
+            "--review-reason" => {
+                reason =
+                    Some(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--review-reason requires an audit reason")
+                    })?)
+            }
             _ => anyhow::bail!(
-                "Usage: sats-arena-server rooms [--bind 127.0.0.1:8738] [--frontend server/frontend/dist]"
+                "Usage: sats-arena-server rooms [--bind ADDR] [--frontend DIR] [--payment-state DIR --payment-wallet-file FILE] [--refund-after-review MATCH_ID --review-reason TEXT]"
             ),
         }
     }
+    let payments = match (payment_state, wallet_file) {
+        (None, None) => None,
+        (Some(root), Some(file)) => Some(crate::payments::Payments::from_file(root, &file).await?),
+        _ => anyhow::bail!("Use --payment-state and --payment-wallet-file together"),
+    };
+    if let Some(id) = refund {
+        let payments = payments
+            .ok_or_else(|| anyhow::anyhow!("Payment configuration is required for review"))?;
+        payments
+            .refund_after_review(
+                &id,
+                reason.ok_or_else(|| anyhow::anyhow!("--review-reason is required"))?,
+            )
+            .await?;
+        for _ in 0..300 {
+            if payments.recover_until_settled(&id).await? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::bail!(
+            "Refunds remain pending; restart the payment server to continue original-payment recovery"
+        );
+    }
+    anyhow::ensure!(
+        reason.is_none(),
+        "--review-reason requires --refund-after-review"
+    );
+    if let Some(payments) = &payments {
+        payments.start_worker();
+    }
+    let app = match payments {
+        Some(payments) => router_with_payments(frontend, Some(payments)),
+        None => router(frontend),
+    };
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("Phone rooms listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, router(frontend))
+    axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

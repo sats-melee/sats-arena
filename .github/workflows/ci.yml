@@ -62,6 +62,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build
         run: cargo build --release -p sats-arena-server --target ${{ matrix.target }}
+      - name: Test room payments and shared match host
+        run: cargo test --release -p sats-arena-server -p sats-arena-local --all-targets --target ${{ matrix.target }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"

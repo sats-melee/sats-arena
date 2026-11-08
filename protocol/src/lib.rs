@@ -3,6 +3,7 @@
 //! Everything here is plain data. The legacy balance protocol is server-authoritative.
 //! Phone rooms only relay the native desktop's payment state and requests.
 
+pub mod netplay;
 pub mod rooms;
 
 use serde::{Deserialize, Serialize};

@@ -570,11 +570,13 @@ impl Demo {
                 }
             }
         }
-        let previous = self.saved.pot.payouts.len();
-        self.saved.pot.flush_due(now_ms());
-        self.consolidate_outbound()?;
-        if previous != self.saved.pot.payouts.len() {
-            self.save()?;
+        if !self.saved.frozen {
+            let previous = self.saved.pot.payouts.len();
+            self.saved.pot.flush_due(now_ms());
+            self.consolidate_outbound()?;
+            if previous != self.saved.pot.payouts.len() {
+                self.save()?;
+            }
         }
         for payout in std::iter::once(&self.saved)
             .chain(self.saved.pending_matches.iter())
@@ -638,7 +640,8 @@ impl Demo {
     }
 
     fn plan_entries(&mut self) {
-        if self.simulation.is_none() && self.saved.pot.phase == Phase::Funding {
+        if !self.saved.frozen && self.simulation.is_none() && self.saved.pot.phase == Phase::Funding
+        {
             for player in 0..4 {
                 if !self.saved.pot.participates(player)
                     || self.require_address(player).is_err()
@@ -750,6 +753,10 @@ impl Demo {
                 continue;
             }
             let owner = self.payout_owner(&payout.id).ok_or(Error::NotFound)?;
+            // A disputed host may reconcile an earlier send, but never initiate another.
+            if owner.frozen && payout.state != PayoutState::InFlight {
+                continue;
+            }
             if owner
                 .group_leader(&payout.id)
                 .is_some_and(|leader| leader != payout.id)
@@ -792,7 +799,8 @@ impl Demo {
             let Some(sats) = entry.received_sats else {
                 continue;
             };
-            if entry.state.complete() {
+            if entry.state.complete() || (self.saved.frozen && entry.state != PayoutState::InFlight)
+            {
                 continue;
             }
             if sats == 0 {

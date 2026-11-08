@@ -1,5 +1,8 @@
 mod api;
 mod config;
+mod netplay;
+mod payment_wallet;
+mod payments;
 mod rooms;
 
 use std::{path::PathBuf, sync::Arc};
