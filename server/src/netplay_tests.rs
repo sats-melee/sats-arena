@@ -807,33 +807,37 @@ async fn pregame_guest_leave_refunds_then_host_reopens_same_room_for_replacement
             .iter()
             .all(|p| p.paid_sats == 0)
     );
-    for _ in 0..1200 {
-        pump(&payments, 1).await;
-        let ledger: Value = serde_json::from_slice(
-            &std::fs::read(temp.path().join(&id).join("prepaid-match.json")).unwrap(),
-        )
-        .unwrap();
-        if ledger["retired_entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry["incoming_hash"] == late_hash && entry["state"] == "Paid")
-        {
-            assert_eq!(fake.payment_attempts(), 2);
-            assert!(
-                payments
-                    .view(current_id)
-                    .await
-                    .ok()
-                    .unwrap()
-                    .players
-                    .iter()
-                    .all(|player| player.paid_sats == 0)
-            );
-            return;
+    // A retired invoice may need two five-second polling windows before its refund.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            pump(&payments, 1).await;
+            let ledger: Value = serde_json::from_slice(
+                &std::fs::read(temp.path().join(&id).join("prepaid-match.json")).unwrap(),
+            )
+            .unwrap();
+            if ledger["retired_entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["incoming_hash"] == late_hash && entry["state"] == "Paid")
+            {
+                assert_eq!(fake.payment_attempts(), 2);
+                assert!(
+                    payments
+                        .view(current_id)
+                        .await
+                        .ok()
+                        .unwrap()
+                        .players
+                        .iter()
+                        .all(|player| player.paid_sats == 0)
+                );
+                return;
+            }
         }
-    }
-    panic!("Late original entry was not refunded on its original record");
+    })
+    .await
+    .expect("Late original entry was not refunded on its original record");
 }
 
 #[tokio::test]
